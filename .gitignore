@@ -1,0 +1,13 @@
+.build/
+Recorder.app/
+Kagu.app/
+vendor/
+work/
+transcripts/
+dist/
+.DS_Store
+# Design drafts carry real recording data; only the logos are kept.
+design/*
+!design/logo/
+plans/
+check/
