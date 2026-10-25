@@ -12,11 +12,12 @@ struct RecorderApp: App {
             ContentView(model: delegate.model)
         }
         .defaultSize(width: 1180, height: 700)
+        .defaultLaunchBehavior(.presented)  // also when it was closed at the last quit, else a launch shows nothing
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button(delegate.model.state == .recording ? "Stop Recording" : "New Recording") { delegate.model.toggle() }
+                Button("New Recording") { Task { await delegate.model.start() } }
                     .keyboardShortcut("n")
-                    .disabled(delegate.model.state == .saving)
+                    .disabled(delegate.model.state != .idle)
                 Button("Stop Recording") { delegate.model.stop() }
                     .keyboardShortcut(".")
                     .disabled(delegate.model.state != .recording)
@@ -33,6 +34,7 @@ struct RecorderApp: App {
             }
             CommandMenu("Playback") {
                 Button("Play or Pause") { delegate.model.player.toggle() }.keyboardShortcut(.space, modifiers: .option)
+                    .disabled(!delegate.model.player.isLoaded)
             }
         }
         Window("Transcribe Audio File", id: "import") {
@@ -158,7 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         model.transcriber.shutDown()  // the engine is a child process: it must not outlive the app
-        guard model.state != .idle else { return .terminateNow }
+        guard model.state != .idle || model.isRecovering else { return .terminateNow }
         model.stop()
         model.whenIdle { NSApp.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
@@ -202,13 +204,29 @@ final class Recorder {
     private var bluetoothMicWasInUse = false
     private var starting = false  // true while waiting for the mic permission answer
     private var idleWaiters: [() -> Void] = []
+    /// Converting a recording left by a crash. Separate from `state`, so it never keeps a new recording from starting.
+    private(set) var isRecovering = false
+    /// Leftovers tried in this run: a file that failed is not tried (and reported) again by the second look.
+    private var attempted: Set<URL> = []
+    /// Frames in the file at the last tick and for how many ticks that stayed the same, to notice a stream that stopped.
+    private var lastFrames = 0
+    private var stalledTicks = 0
+    /// For the warning about missing system audio permission: how long something played, and the loudest Mac sample so far.
+    private var outputTicks = 0
+    private var systemPeakEver: Float = 0
 
     init() {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         library = Library(folder: folder)
-        transcriber.shouldPause = { [unowned self] in self.state != .idle }
+        transcriber.shouldPause = { [unowned self] in self.state != .idle || self.isRecovering }
         transcriber.resumeInterrupted(recordings: folder)
         recoverLeftovers()
+        // A file that changed in the last seconds is skipped above (it may still be written); look again once it settled.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(12))
+            while self?.isRecovering == true { try? await Task.sleep(for: .seconds(1)) }  // after the first look, not instead of it
+            self?.recoverLeftovers()
+        }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.stop(reason: "Saved because the Mac went to sleep.") }
         }
@@ -239,7 +257,12 @@ final class Recorder {
         guard free > 1 << 30 else { return fail("Not enough disk space. Free up at least 1 GB to record.") }
 
         let stamp = Date().formatted(.verbatim("\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits) \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)).\(minute: .twoDigits).\(second: .twoDigits)", timeZone: .current, calendar: .current))
-        let url = folder.appending(path: ".Recording \(stamp).caf")
+        var url = folder.appending(path: ".Recording \(stamp).caf")
+        var n = 2
+        while FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: Convert.finalURL(for: url).path) {
+            url = folder.appending(path: ".Recording \(stamp) \(n).caf")
+            n += 1
+        }
         do {
             let capture = try Capture(url: url)
             capture.onFault = { [weak self] reason in self?.stop(reason: "Saved early: \(reason).") }
@@ -250,6 +273,10 @@ final class Recorder {
             isPaused = false
             elapsed = 0
             levelHistory = []
+            lastFrames = 0
+            stalledTicks = 0
+            outputTicks = 0
+            systemPeakEver = 0
             state = .recording
             recordingWindow.show(model: self)
             AccessibilityNotification.Announcement("Recording started").post()
@@ -285,7 +312,9 @@ final class Recorder {
         Task.detached {
             var error = capture.stop()
             var tracks: URL?
-            if error == nil {
+            let empty = error == nil && capture.framesWritten == 0
+            if empty { try? FileManager.default.removeItem(at: capture.url) }
+            if error == nil, !empty {
                 do { tracks = try Convert.run(caf: capture.url, to: m4a, keepRaw: keepRaw, tracksFolder: tracksFolder) } catch let e { error = e }
             }
             await MainActor.run {
@@ -293,7 +322,7 @@ final class Recorder {
                 if error == nil, let since = self.savingSince { SaveRate.record(saving: Date().timeIntervalSince(since), audio: seconds) }
                 self.savingSince = nil
                 self.savingEstimate = nil
-                if let error { self.fail("Could not finish saving: \(error.localizedDescription) The original audio is kept at \(capture.url.path).") } else { self.lastFile = m4a }
+                if let error { self.fail("Could not finish saving: \(error.localizedDescription) The original audio is kept at \(capture.url.path).") } else if empty { self.fail("Nothing was recorded: the audio stream did not start.") } else { self.lastFile = m4a }
                 self.finishTracks(m4a: m4a, tracks: tracks)
                 self.becomeIdle()
             }
@@ -328,7 +357,7 @@ final class Recorder {
 
     /// Runs `action` once nothing is recording or saving.
     func whenIdle(_ action: @escaping () -> Void) {
-        if state == .idle { action() } else { idleWaiters.append(action) }
+        if state == .idle && !isRecovering { action() } else { idleWaiters.append(action) }
     }
 
     private func tick() {
@@ -337,6 +366,7 @@ final class Recorder {
             return stop(reason: "Saved early: \(reason).")
         }
         let peaks = capture.takePeaks()
+        systemPeakEver = max(systemPeakEver, peaks.system)
         micLevel = max(peaks.mic, micLevel * 0.85)
         systemLevel = max(peaks.system, systemLevel * 0.85)
         elapsed = Double(capture.framesKept.load(ordering: .relaxed)) / capture.sampleRate
@@ -344,9 +374,22 @@ final class Recorder {
             levelHistory.append(max(micLevel, systemLevel))
             if levelHistory.count > 120 { levelHistory.removeFirst(levelHistory.count - 120) }
         }
+        // A stream that stopped without any device notice (another app holding the mic, a stuck audio server).
+        let frames = capture.framesKept.load(ordering: .relaxed)
+        stalledTicks = !isPaused && frames == lastFrames ? stalledTicks + 1 : 0
+        lastFrames = frames
+        if stalledTicks > 75 { return stop(reason: "Saved early: the audio stream stopped.") }  // 5 s
+        // Without the system audio permission the tap delivers exact zeros while something plays.
+        if !isPaused, ticks % 15 == 0, capture.outputIsPlayingElsewhere() { outputTicks += 15 }  // paused, nothing is heard on purpose
         let silent = !isPaused && capture.micZeroRun.load(ordering: .relaxed) > Int(capture.sampleRate)
-        let text = silent ? "No sound from the mic. Another app may be using it, or Kagu has no mic access." : nil
-        if text != nil, warning == nil { AccessibilityNotification.Announcement(text!).post() }
+        // A running output can be silent (a call before anyone talks), so a whole minute, and not one sample heard.
+        let deaf = !isPaused && systemPeakEver == 0 && outputTicks >= 900
+        let text = silent ? "No sound from the mic. Another app may be using it, or Kagu has no mic access."
+            : deaf ? "No sound from the Mac yet. If you hear the call, allow Kagu in System Settings, Privacy & Security, Screen & System Audio Recording." : nil
+        if let text, warning == nil {
+            AccessibilityNotification.Announcement(text).post()
+            log("warning: \(text)")
+        }
         warning = text
 
         ticks += 1
@@ -361,14 +404,22 @@ final class Recorder {
 
     private func becomeIdle() {
         state = .idle
+        runIdleWaiters()
+    }
+
+    /// Recovery ends on its own time: a recording may be running by then, so it only runs the waiters, never sets `state`.
+    private func runIdleWaiters() {
+        guard state == .idle, !isRecovering else { return }
         let waiters = idleWaiters
         idleWaiters = []
         waiters.forEach { $0() }
     }
 
+    /// The notice is in the library window, so the window comes up when it is closed (a recording started from the menu bar).
     private func fail(_ text: String) {
         notify(text)
         report = log("error: \(text)")
+        openMainWindow?()
     }
 
     /// A short line at the top of the list; it goes away by itself.
@@ -384,9 +435,11 @@ final class Recorder {
     }
 
     private func recoverLeftovers() {
-        let leftovers = Convert.leftovers(in: folder)
+        guard !isRecovering else { return }
+        let leftovers = Convert.leftovers(in: folder).filter { $0 != capture?.url && !attempted.contains($0) }  // never the take being saved right now
         guard !leftovers.isEmpty else { return }
-        state = .saving
+        attempted.formUnion(leftovers)
+        isRecovering = true
         let keepRaw = keepRaw
         Task.detached {
             var recovered: URL?
@@ -397,8 +450,14 @@ final class Recorder {
                 // A marker survives a crash inside the conversion; the next try then skips echo
                 // removal, so one bad file cannot crash the app on every launch.
                 let marker = caf.appendingPathExtension("trying")
-                let retry = FileManager.default.fileExists(atPath: marker.path)
-                FileManager.default.createFile(atPath: marker.path, contents: nil)
+                let tries = (try? String(contentsOf: marker, encoding: .utf8)).map { Int($0) ?? 1 } ?? 0
+                guard tries < 2 else {  // crashed with and without echo removal: leave it be
+                    failed = caf
+                    log("recover skipped for \(caf.lastPathComponent): it stopped the app twice")
+                    continue
+                }
+                let retry = tries > 0
+                try? "\(tries + 1)".write(to: marker, atomically: true, encoding: .utf8)
                 do {
                     let tracksFolder = Tracks.folder(stamp: m4a.deletingPathExtension().lastPathComponent)
                     let tracks = try Convert.run(caf: caf, to: m4a, keepRaw: keepRaw, cancelEcho: !retry, tracksFolder: tracksFolder)
@@ -418,7 +477,8 @@ final class Recorder {
                     self.notify("Recovered an unfinished recording.")
                 }
                 if let failed { self.fail("Could not recover an unfinished recording; it is kept at \(failed.path).") }
-                self.becomeIdle()
+                self.isRecovering = false
+                self.runIdleWaiters()
             }
         }
     }

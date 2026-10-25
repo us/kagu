@@ -145,9 +145,9 @@ enum Tracks {
     static func folder(stamp: String) -> URL { cache.appending(path: stamp) }
 
     /// Removes track folders older than a day: an interrupted transcription leaves its tracks behind.
-    static func sweep() {
+    static func sweep(keeping: Set<URL> = []) {
         let items = (try? FileManager.default.contentsOfDirectory(at: cache, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        for item in items {
+        for item in items where !keeping.contains(item.standardizedFileURL) {
             let modified = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             if modified < Date(timeIntervalSinceNow: -86_400) { try? FileManager.default.removeItem(at: item) }
         }

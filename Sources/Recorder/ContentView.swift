@@ -103,7 +103,8 @@ struct ContentView: View {
                 if isEmpty {
                     EmptyLibrary(model: model)
                 } else if let item = selectedItem {
-                    DetailView(item: item, model: model, player: model.player) { selection = $0 }.id(item.id)
+                    // Only while it is still the one shown: a title committed as another row is clicked must not pull the selection back.
+                    DetailView(item: item, model: model, player: model.player) { old, new in if selection == old { selection = new } }.id(item.id)
                 } else {
                     ContentUnavailableView("Select a Recording", systemImage: "waveform")
                 }
@@ -114,7 +115,13 @@ struct ContentView: View {
         .navigationTitle(selectedItem?.displayTitle ?? "Recordings")
         .toolbar(removing: .title)  // the recording's own title is already large in the detail pane
         .toolbarBackground(.hidden, for: .windowToolbar)
-        .frame(minWidth: 1120, minHeight: 560)
+        .frame(minWidth: 960, minHeight: 520)
+        // Space plays wherever the focus is (the list after a click, the detail), except in a text field.
+        .onKeyPress(.space) {
+            if NSApp.keyWindow?.firstResponder is NSText || !model.player.isLoaded { return .ignored }
+            model.player.toggle()
+            return .handled
+        }
         .onAppear {
             columns = isEmpty ? .detailOnly : .all
             model.openMainWindow = { [openWindow] in openWindow(id: "main") }
@@ -136,8 +143,14 @@ struct ContentView: View {
         .onChange(of: library.folders) { _, folders in if case .folder(let name?) = scope, !folders.contains(name) { scope = .all } }
         .onChange(of: model.lastFile) { _, file in
             library.reload()
-            if let file { selection = file }
+            guard let file else { return }
+            if case .folder(let name?) = scope, file.deletingLastPathComponent().lastPathComponent != name { scope = .all }  // a new recording is in Recordings
+            if case .tag = scope { scope = .all }
+            selection = file
         }
+        // Another folder, tag or search: what was selected may not be in the list any more. As in Notes, the first one shown is.
+        .onChange(of: scope) { keepSelectionShown() }
+        .onChange(of: search) { keepSelectionShown() }
     }
 
     // MARK: Sidebar
@@ -244,6 +257,7 @@ struct ContentView: View {
                                     .id(item.id)
                                     .contentShape(Rectangle())
                                     .onTapGesture { selection = item.id; listFocused = true }
+                                    .accessibilityAction { selection = item.id; listFocused = true }  // VoiceOver and keyboard access select it too
                                     .draggable(item.url.path)  // a path, not the file: a drop outside the app cannot take the audio away from its parts
                                     .contextMenu { rowMenu(item) }
                                 if index < section.items.count - 1, item.id != selection, section.items[index + 1].id != selection {
@@ -260,7 +274,7 @@ struct ContentView: View {
                 .focused($listFocused)
                 .focusEffectDisabled()
                 .onMoveCommand { direction in moveSelection(direction, ids: sections.flatMap { $0.items.map(\.id) }, proxy: proxy) }
-                .onDeleteCommand { if let item = selectedItem { trash(item) } }
+                .onDeleteCommand { if let item = selectedItem, shown.contains(where: { $0.id == item.id }) { trash(item) } }
                 .overlay {
                     if shown.isEmpty, !search.isEmpty {
                         ContentUnavailableView.search(text: search)
@@ -309,6 +323,7 @@ struct ContentView: View {
             return false
         }
         var failed: [String] = []
+        library.moveProblem = nil
         for item in items {
             if let url = library.move(item, to: name) {
                 if item.id == selection { selection = url }
@@ -360,6 +375,15 @@ struct ContentView: View {
         default: return
         }
         if let selection { proxy.scrollTo(selection) }
+    }
+
+    private func keepSelectionShown() {
+        let visible = shown
+        if let selection {
+            // A selection the library has not read yet (a recording that was just saved) is left alone.
+            guard library.items.contains(where: { $0.id == selection }), !visible.contains(where: { $0.id == selection }) else { return }
+        }
+        selection = visible.first?.id  // also after a search that matched nothing is cleared
     }
 
     private func trash(_ item: RecordingItem) {
@@ -743,7 +767,7 @@ struct RecordButton: View {
         .buttonStyle(PressStyle())
         .disabled(model.state == .saving)
         .accessibilityLabel(model.state == .recording ? "Stop recording" : model.state == .saving ? "Saving" : "Start recording")
-        .help(model.state == .recording ? "Stop and save (⌘N)" : "Record (⌘N)")
+        .help(model.state == .recording ? "Stop and save (⌘.)" : "Record (⌘N)")
     }
 }
 

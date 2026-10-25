@@ -42,6 +42,12 @@ final class Transcriber {
     private var shuttingDown = false
     private var idleWaiters: [() -> Void] = []
     private var pollers: [URL: Task<Void, Never>] = [:]
+    /// The model each waiting request downloads (the one chosen when it was asked for).
+    private var waiting: [URL: WhisperModel] = [:]
+    /// Downloads a Transcribe press started (not Settings): they stop when their last waiting request is cancelled.
+    private var ownedDownloads: Set<WhisperModel> = []
+    /// The latest preparation per recording: one that was cancelled and asked for again must not queue twice.
+    private var preparing: [URL: UUID] = [:]
     /// Set by the recorder: a new job does not start while a recording is running (CPU and memory for the capture).
     var shouldPause: () -> Bool = { false }
 
@@ -52,7 +58,6 @@ final class Transcriber {
         language = defaults.string(forKey: "whisperLanguage") ?? "auto"
         // One model on disk and another one selected: use the one that is there.
         if models.state(model) != .installed, let installed = WhisperModel.allCases.first(where: { models.state($0) == .installed }) { model = installed }
-        Tracks.sweep()
     }
 
     /// True when a finished recording should go straight into a transcript.
@@ -72,32 +77,43 @@ final class Transcriber {
         if models.state(model) == .installed {
             prepare(source)
         } else {
+            let wanted = model  // Settings may pick another model meanwhile; this request waits for this one
             states[source] = .downloadingModel
-            models.download(model)
+            var running = false
+            if case .downloading = models.state(wanted) { running = true }
+            if !running { ownedDownloads.insert(wanted) }
+            waiting[source] = wanted
+            models.download(wanted)
             pollers[source]?.cancel()
             pollers[source] = Task {
-                while models.state(model) != .installed, models.state(model) != .missing {
+                while models.state(wanted) != .installed, models.state(wanted) != .missing {
                     try? await Task.sleep(for: .milliseconds(400))
                     if Task.isCancelled { return }
                 }
                 pollers[source] = nil
+                waiting[source] = nil
+                ownedDownloads.remove(wanted)  // finished or stopped: nothing left to own
                 guard states[source] == .downloadingModel else { return }
-                if models.state(model) == .installed { prepare(source) } else { fail(source, models.message ?? "The download was stopped.") }
+                if models.state(wanted) == .installed { prepare(source) } else { fail(source, models.message ?? "The download was stopped.") }
             }
         }
     }
 
     /// Stops a transcript in progress for one recording.
     func cancel(_ source: URL) {
-        let wasDownloading = states[source] == .downloadingModel
+        let wait = waiting.removeValue(forKey: source)
         states[source] = nil
+        preparing[source] = nil
         pollers[source]?.cancel()
         pollers[source] = nil
         for job in queue where job.source == source { try? FileManager.default.removeItem(at: job.cleanup) }
         queue.removeAll { $0.source == source }
         if current?.job.source == source { current?.process.cancel() }
-        // Nobody else waits for the model: stop downloading it.
-        if wasDownloading, !states.values.contains(.downloadingModel) { models.cancelDownload(model) }
+        // Nobody else waits for the model and this request started the download (not Settings): stop it.
+        if let wait, ownedDownloads.contains(wait), !waiting.values.contains(wait) {
+            ownedDownloads.remove(wait)
+            models.cancelDownload(wait)
+        }
         checkIdle()
     }
 
@@ -115,9 +131,13 @@ final class Transcriber {
     /// any other file is one "Speaker" track, because a mixed file cannot be split.
     private func prepare(_ source: URL) {
         states[source] = .queued
-        let folder = Tracks.folder(stamp: "job-\(UUID().uuidString)")
+        let token = UUID()
+        preparing[source] = token
         let sidecar = Library.sidecarURL(for: source)
         let split = FileManager.default.fileExists(atPath: sidecar.path)
+        // ponytail: a folder of its own per job (two folders can hold a "Meeting.m4a"), so a quit in the middle of a manual
+        // transcript is not resumed; the sidecar stays, Transcribe again starts over.
+        let folder = Tracks.folder(stamp: "job-\(token.uuidString)")
         Task {
             do {
                 var tracks: [(speaker: String, wav: URL)] = []
@@ -135,13 +155,16 @@ final class Transcriber {
                     tracks = [("Speaker", wav)]
                     output = source.deletingPathExtension().appendingPathExtension("transcript.md")
                 }
-                guard states[source] == .queued else {  // cancelled meanwhile
-                    try? FileManager.default.removeItem(at: folder)
+                guard states[source] == .queued, preparing[source] == token else {  // cancelled meanwhile (and maybe asked for again)
+                    try? FileManager.default.removeItem(at: folder)  // this preparation's own folder
                     return
                 }
+                preparing[source] = nil
                 enqueue(Job(source: source, title: source.deletingPathExtension().lastPathComponent, tracks: tracks, output: output, cleanup: folder))
             } catch {
                 try? FileManager.default.removeItem(at: folder)
+                guard preparing[source] == token else { return }
+                preparing[source] = nil
                 fail(source, "Could not read the audio: \(error.localizedDescription)")
             }
         }
@@ -150,6 +173,9 @@ final class Transcriber {
     /// A quit in the middle of a transcription leaves its two tracks in the cache. On the next launch the
     /// job runs again, so an interrupted recording still gets its transcript.
     func resumeInterrupted(recordings: URL) {
+        // Old leftovers go only after the interrupted jobs are picked up (a quit on Friday, opened on Monday).
+        var resumed: Set<URL> = []
+        defer { Tracks.sweep(keeping: resumed) }
         // Test runs (any `--flag`) must not start real work.
         guard models.state(model) == .installed, Whisper.binary != nil, !CommandLine.arguments.dropFirst().contains(where: { $0.hasPrefix("--") }) else { return }
         let folders = (try? FileManager.default.contentsOfDirectory(at: Tracks.cache, includingPropertiesForKeys: nil)) ?? []
@@ -162,6 +188,7 @@ final class Transcriber {
                   FileManager.default.fileExists(atPath: folder.appending(path: "them.wav").path),
                   !FileManager.default.fileExists(atPath: m4a.deletingPathExtension().appendingPathExtension("md").path) else { continue }
             log("resuming an interrupted transcript: \(stem)")
+            resumed.insert(folder.standardizedFileURL)
             enqueueRecording(m4a: m4a, tracks: folder)
         }
     }
@@ -254,6 +281,8 @@ final class Transcriber {
         defer { current = nil }
         states[job.source] = .running(0)
         let language = language
+        // The chosen model, or one that is on disk: Settings may have picked a model that is not downloaded yet.
+        let model = models.state(model) == .installed ? model : WhisperModel.allCases.first { models.state($0) == .installed } ?? model
         do {
             guard models.state(model) == .installed else { throw RecorderError("The speech model is not downloaded.") }
             let results = try await Whisper.run(model: models.url(model), tracks: job.tracks.map(\.wav), language: language, handle: process) { [weak self] value in

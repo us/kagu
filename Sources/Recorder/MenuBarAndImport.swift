@@ -62,8 +62,8 @@ struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(systemName: model.state == .recording ? "record.circle.fill" : "record.circle")
-            .accessibilityLabel(model.state == .recording ? "Kagu, recording" : "Kagu")
+        Image(systemName: model.state != .recording ? "record.circle" : model.isPaused ? "pause.circle.fill" : "record.circle.fill")
+            .accessibilityLabel(model.state != .recording ? "Kagu" : model.isPaused ? "Kagu, paused" : "Kagu, recording")
             .onAppear { model.openMainWindow = { [openWindow] in openWindow(id: "main") } }
     }
 }

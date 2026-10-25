@@ -228,7 +228,7 @@ private struct GeneralSettings: View {
         }
         SettingRow(label: "Shortcuts") {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 6) {
-                shortcut("New or stop recording", "⌘N")
+                shortcut("New recording", "⌘N")
                 shortcut("Stop recording", "⌘.")
                 shortcut("Pause or resume", "⇧⌘P")
                 shortcut("Play or pause", "Space")

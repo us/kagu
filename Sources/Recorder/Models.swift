@@ -68,7 +68,11 @@ final class ModelStore {
     private var resumeData: [WhisperModel: Data] = [:]
 
     init() {
-        for model in WhisperModel.allCases { states[model] = isInstalled(model) ? .installed : .missing }
+        for model in WhisperModel.allCases {
+            // A download cut off while it was checked (the app quit) leaves gigabytes nobody resumes.
+            try? FileManager.default.removeItem(at: folder.appending(path: model.rawValue + ".partial"))
+            states[model] = isInstalled(model) ? .installed : .missing
+        }
     }
 
     func state(_ model: WhisperModel) -> State { states[model] ?? .missing }
@@ -114,11 +118,10 @@ final class ModelStore {
     func cancelDownload(_ model: WhisperModel) {
         guard let download = downloads.removeValue(forKey: model) else { return }
         // The resume data lets the next Download continue where this one stopped.
+        // At once, so a Download right after it starts again instead of seeing the old one still running.
+        if case .downloading = state(model) { states[model] = .missing }
         download.task.cancel { [weak self] data in
-            Task { @MainActor in
-                if let data { self?.resumeData[model] = data }
-                if case .downloading = self?.state(model) { self?.states[model] = .missing }  // not over a finished download
-            }
+            Task { @MainActor in if let data { self?.resumeData[model] = data } }
         }
         download.session.finishTasksAndInvalidate()
     }
@@ -159,7 +162,12 @@ final class ModelStore {
 
     /// Moves a finished download into place only when its SHA-256 matches; a damaged file is deleted.
     nonisolated static func install(partial: URL, as target: URL, sha256 expected: String) throws {
-        guard try sha256(of: partial) == expected else {
+        let hash: String
+        do { hash = try sha256(of: partial) } catch {
+            try? FileManager.default.removeItem(at: partial)
+            throw error
+        }
+        guard hash == expected else {
             try? FileManager.default.removeItem(at: partial)
             throw RecorderError("The download is damaged and was deleted. Press Download to try again.")
         }

@@ -18,9 +18,16 @@ struct RecordingItem: Identifiable, Hashable, Sendable {
     var sidecar: URL { Library.sidecarURL(for: url) }
 
     /// "Recording 2026-10-21 17.07.14" is shown as "Oct 21 at 5:07 PM"; a name the user chose is shown as it is.
-    var hasDefaultName: Bool { stem.wholeMatch(of: /Recording \d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.\d{2}/) != nil }
+    var hasDefaultName: Bool { stem.wholeMatch(of: /Recording \d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.\d{2}( \d+)?/) != nil }  // " 2": a second take in the same second
     var displayTitle: String { hasDefaultName ? date.formatted(.dateTime.month(.abbreviated).day().hour().minute()) : stem }
     var title: String { displayTitle }
+
+    /// The same recording after its files moved to `url` (a rename or a move), until the next scan reads it again.
+    func moved(to url: URL, folder: String?) -> RecordingItem {
+        let stem = url.deletingPathExtension().lastPathComponent
+        let transcript = transcript.map { url.deletingLastPathComponent().appending(path: stem + $0.lastPathComponent.dropFirst(self.stem.count)) }
+        return RecordingItem(url: url, date: date, duration: duration, transcript: transcript, transcriptText: transcriptText, tags: tags, accession: accession, folder: folder, preview: preview)
+    }
 }
 
 /// The recordings in the Recordings folder (every visible `.m4a`) with their transcripts,
@@ -104,7 +111,7 @@ final class Library {
         for place in places {
         let files = (try? FileManager.default.contentsOfDirectory(at: place.url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
         // Regular files only: a folder named "x.m4a" is not a recording.
-        for url in files where url.pathExtension == "m4a" && !url.lastPathComponent.contains(".partial") && ((try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false) {
+        for url in files where url.pathExtension == "m4a" && !url.lastPathComponent.hasSuffix(".partial.m4a") && ((try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false) {
             let values = try? url.resourceValues(forKeys: Set(keys))
             let modified = values?.contentModificationDate ?? .distantPast
             var duration = 0.0
@@ -120,7 +127,7 @@ final class Library {
                 .first { Self.isFile($0) }
             let text = transcript.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
             // A default name holds the moment the recording started; the file date is when it was saved (later, for a recovered one).
-            let started = DateFormatter.recordingStamp.date(from: String(stem.lastPathComponent.dropFirst("Recording ".count)))
+            let started = DateFormatter.recordingStamp.date(from: String(stem.lastPathComponent.dropFirst("Recording ".count).prefix(19)))
             let preview = Transcript.parse(text).first.map { String($0.text.prefix(160)) } ?? (transcript != nil ? "No speech found" : "No transcript")
             items.append(RecordingItem(url: url, date: stem.lastPathComponent.hasPrefix("Recording ") ? started ?? values?.creationDate ?? modified : values?.creationDate ?? modified, duration: duration, transcript: transcript, transcriptText: text, tags: values?.tagNames ?? [], accession: Register.read(url), folder: place.name, preview: preview))
         }
@@ -165,6 +172,10 @@ final class Library {
     nonisolated static func cleanName(_ name: String) -> String {
         var clean = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-").trimmingCharacters(in: .whitespacesAndNewlines)
         while clean.hasPrefix(".") { clean.removeFirst() }  // a leading dot would hide it
+        // Room for the longest part ending (".transcript.md", the sidecar's dot and ".tracks.m4a") and a " 99".
+        // Cut before the endings are checked, so the cut cannot leave one behind.
+        while clean.utf8.count > 200 { clean.removeLast() }
+        clean = clean.trimmingCharacters(in: .whitespaces)
         var changed = true
         while changed {
             changed = false
@@ -173,7 +184,7 @@ final class Library {
                 changed = true
             }
         }
-        return clean
+        return clean.trimmingCharacters(in: .whitespaces)
     }
 
     /// Moves every part of a recording to `stem` in `directory`, adding " 2", " 3" when the name is taken.
@@ -207,11 +218,18 @@ final class Library {
             }
         }
         guard !done.isEmpty else { return nil }
-        return targets(name)[0]
+        let url = targets(name)[0]
+        // At once, not at the next scan: the selection follows the new place without the detail going blank.
+        if let i = items.firstIndex(where: { $0.id == item.id }) {
+            items[i] = item.moved(to: url, folder: directory.standardizedFileURL == folder.standardizedFileURL ? nil : directory.lastPathComponent)
+        }
+        return url
     }
 
-    /// Set when a failed move could not be put back completely; the view shows it once.
+    /// Set when a failed move could not be put back completely; the view shows it once and clears it.
     var moveProblem: String?
+    /// Recordings on their way to the Trash (it is asynchronous): a title edit left open must not rename them meanwhile.
+    private(set) var trashing: Set<URL> = []
 
     nonisolated static func sameFile(_ a: URL, _ b: URL) -> Bool {
         let key = URLResourceKey.fileResourceIdentifierKey
@@ -273,6 +291,7 @@ final class Library {
     /// `moved` maps each recording's old place to its new one (a taken name gets " 2").
     func deleteFolder(_ name: String) -> (note: String?, moved: [URL: URL]) {
         guard Self.subfolders(of: folder).contains(name) else { return (nil, [:]) }
+        moveProblem = nil
         var moved: [URL: URL] = [:]
         // Read from disk, not from the last reload: the folder may have changed a moment ago.
         for item in Self.scan(folder, known: known).items where item.folder == name {
@@ -300,6 +319,7 @@ final class Library {
         let clean = Self.cleanName(name).replacingOccurrences(of: ".partial", with: "")
         guard !clean.isEmpty, clean != item.stem else { return nil }
         // It stays in its own folder.
+        moveProblem = nil
         let url = moveParts(of: item, to: item.url.deletingLastPathComponent(), stem: clean)
         reload()
         return url
@@ -308,8 +328,12 @@ final class Library {
     /// Moves a recording, its transcript and its sidecar to the Trash (they can be put back from there).
     func trash(_ item: RecordingItem) {
         let files = Self.parts(of: item.url).filter { Self.isFile($0) }
+        trashing.insert(item.url)
         NSWorkspace.shared.recycle(files) { [weak self] _, _ in
-            Task { @MainActor in self?.reload() }
+            Task { @MainActor in
+                self?.trashing.remove(item.url)
+                self?.reload()
+            }
         }
     }
 
@@ -323,12 +347,14 @@ final class Library {
     /// One FSEvents stream over the Recordings folder and its subfolders. The library lives as long as the app.
     private func watch() {
         var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
-        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
-            guard let info else { return }
+        let callback: FSEventStreamCallback = { _, info, _, paths, _, _ in
+            // A recording being written changes its hidden CAF all the time; the scan never shows hidden files.
+            guard let info, let names = unsafeBitCast(paths, to: NSArray.self) as? [String],
+                  names.contains(where: { !URL(fileURLWithPath: $0).lastPathComponent.hasPrefix(".") }) else { return }
             let library = Unmanaged<Library>.fromOpaque(info).takeUnretainedValue()
             MainActor.assumeIsolated { library.scheduleReload() }  // the stream runs on the main queue
         }
-        guard let stream = FSEventStreamCreate(nil, callback, &context, [folder.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.3, FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone)) else { return }
+        guard let stream = FSEventStreamCreate(nil, callback, &context, [folder.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.3, FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes)) else { return }
         FSEventStreamSetDispatchQueue(stream, .main)
         FSEventStreamStart(stream)
         self.stream = stream

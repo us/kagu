@@ -34,6 +34,11 @@ enum Selftest {
         expect(item.transcript?.lastPathComponent == "Recording 2026-10-21 17.07.14.md", "transcript is found next to the recording")
         let parts = Calendar.current.dateComponents([.hour, .minute, .second], from: item.date)
         expect(parts.hour == 17 && parts.minute == 7 && parts.second == 14, "the date comes from the name: \(item.date)")
+        let second = RecordingItem(url: folder.appending(path: "Recording 2026-10-21 17.07.14 2.m4a"), date: .now, duration: 0, transcript: nil, transcriptText: "", tags: [])
+        expect(second.hasDefaultName, "a second take in the same second still shows as its date")
+        let relocated = item.moved(to: folder.appending(path: "Clients/Team sync.m4a"), folder: "Clients")
+        expect(relocated.transcript?.path == folder.appending(path: "Clients/Team sync.md").path && relocated.folder == "Clients" && relocated.date == item.date, "a moved item points at its moved transcript: \(relocated.transcript?.path ?? "none")")
+        expect(Library.cleanName(String(repeating: "ğ", count: 300)).utf8.count <= 200, "a long name is cut to fit the file system")
 
         let library = Library(folder: folder)
         // The title field hands back the displayed date title with plain spaces: that must not rename anything.

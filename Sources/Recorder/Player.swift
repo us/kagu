@@ -10,9 +10,12 @@ final class Player {
 
     private var player: AVAudioPlayer?
     private var timer: Timer?
+    private var url: URL?
+    var isLoaded: Bool { player != nil }
 
     func load(_ url: URL) {
         stop()
+        self.url = url
         player = try? AVAudioPlayer(contentsOf: url)
         player?.prepareToPlay()
         duration = player?.duration ?? 0
@@ -45,9 +48,20 @@ final class Player {
 
     func stop() {
         player?.stop()
+        player?.currentTime = 0
         timer?.invalidate()
         isPlaying = false
         time = 0
+    }
+
+    /// Lets go of `url` when it is the loaded file, so Play or Pause cannot start a recording that left the screen.
+    /// Only that file: the pane that shows next may already have loaded its own.
+    func unload(_ url: URL) {
+        guard url == self.url else { return }
+        stop()
+        player = nil
+        self.url = nil
+        duration = 0
     }
 
     private func tick() {
