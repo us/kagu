@@ -35,6 +35,7 @@ enum Convert {
             let canceller = cancelEcho ? EchoCanceller(sampleRate: rate) : nil
             while input.framePosition < input.length {
                 try input.read(into: inBuffer, frameCount: AVAudioFrameCount(chunk))
+                if inBuffer.frameLength == 0 { break }  // a file shorter than its header says; the length check below catches it
                 let c = inBuffer.floatChannelData!
                 let n = Int(inBuffer.frameLength)
                 mic.update(from: c[0], count: n)
@@ -53,15 +54,19 @@ enum Convert {
             return canceller
         }
 
-        // Pass 1 finds the peak for both outcomes and whether there is any echo to remove at all.
-        var cleanPeak: Float = 0, rawPeak: Float = 0
+        // Pass 1 finds the peak for both outcomes and whether there is any echo to remove at all. The peak depends on
+        // the mic boost, which is only known after this pass, so it is kept for each boost the mic can get.
+        let boosts: [Float] = [1, 1.5, 2, 3, 4, 5, 6]
+        var cleanPeaks = [Float](repeating: 0, count: boosts.count), rawPeaks = cleanPeaks
         // Loudness of the voice parts only (samples above about -42 dBFS), for the mic and for the Mac audio.
         var micSquares = 0.0, micCount = 0.0, sysSquares = 0.0, sysCount = 0.0
         let floor: Float = 0.008
         let probe = try pass(cancelEcho: cancelEcho) { m, raw, l, r, n in
             for i in 0..<n {
-                cleanPeak = max(cleanPeak, abs(l[i] + m[i]), abs(r[i] + m[i]))
-                rawPeak = max(rawPeak, abs(l[i] + raw[i]), abs(r[i] + raw[i]))
+                for (k, b) in boosts.enumerated() {
+                    cleanPeaks[k] = max(cleanPeaks[k], abs(l[i] + m[i] * b), abs(r[i] + m[i] * b))
+                    rawPeaks[k] = max(rawPeaks[k], abs(l[i] + raw[i] * b), abs(r[i] + raw[i] * b))
+                }
                 if abs(m[i]) > floor { micSquares += Double(m[i] * m[i]); micCount += 1 }
                 let system = (l[i] + r[i]) / 2
                 if abs(system) > floor { sysSquares += Double(system * system); sysCount += 1 }
@@ -72,10 +77,12 @@ enum Convert {
         let minimum = rate  // one second of voice, else there is nothing to measure
         let micRMS = micCount > minimum ? Float((micSquares / micCount).squareRoot()) : 0
         let sysRMS = sysCount > minimum ? Float((sysSquares / sysCount).squareRoot()) : 0
-        let micGain: Float = micRMS > 0 ? min(6, max(1, max(sysRMS, 0.07) / micRMS)) : 1
+        let wanted: Float = micRMS > 0 ? min(6, max(1, max(sysRMS, 0.07) / micRMS)) : 1
+        let step = boosts.lastIndex { $0 <= wanted } ?? 0  // the boost is rounded down to one whose peak is known
+        let micGain = boosts[step]
         let reduction = probe?.echoReductionDB ?? 0
         let removeEcho = reduction >= 2  // headphones measure about 0.4 dB: then the mic stays exactly as recorded
-        let peak = removeEcho ? cleanPeak : rawPeak
+        let peak = removeEcho ? cleanPeaks[step] : rawPeaks[step]
         let gain = peak > 0.9 ? 0.9 / peak : 1  // AAC overshoots peaks a little, keep 1 dB of room
 
         let partial = m4a.deletingPathExtension().appendingPathExtension("partial.m4a")
@@ -128,6 +135,9 @@ enum Convert {
         guard abs(written - input.length) <= 2048 else {
             throw RecorderError("The saved recording is incomplete.")
         }
+        // Before the m4a appears: once the recording is in the library it is whole, so a rename or a transcript
+        // made right away has both sides.
+        do { try Tracks.writeSidecar(me: sink.me.url, them: sink.them.url, to: Library.sidecarURL(for: m4a)) } catch { log("sidecar failed: \(error)") }
         if FileManager.default.fileExists(atPath: m4a.path) {
             _ = try FileManager.default.replaceItemAt(m4a, withItemAt: partial)
         } else {
@@ -140,7 +150,6 @@ enum Convert {
         } else {
             try FileManager.default.removeItem(at: caf)
         }
-        do { try Tracks.writeSidecar(me: sink.me.url, them: sink.them.url, to: Library.sidecarURL(for: m4a)) } catch { log("sidecar failed: \(error)") }
         finished = true
         return tracksFolder
     }

@@ -8,7 +8,7 @@ struct DetailView: View {
     let item: RecordingItem
     let model: Recorder
     let player: Player
-    let onRename: (URL) -> Void
+    let onRename: (_ old: URL, _ new: URL) -> Void
 
     enum Tab { case transcript, details }
 
@@ -21,16 +21,17 @@ struct DetailView: View {
     @FocusState private var titleFocused: Bool
     @FocusState private var queryFocused: Bool
 
-    init(item: RecordingItem, model: Recorder, player: Player, onRename: @escaping (URL) -> Void) {
+    init(item: RecordingItem, model: Recorder, player: Player, onRename: @escaping (_ old: URL, _ new: URL) -> Void) {
         self.item = item
         self.model = model
         self.player = player
         self.onRename = onRename
         _title = State(initialValue: item.displayTitle)
+        blocks = Transcript.parse(item.transcriptText)  // once per update, not once per place that shows it
     }
 
     private var transcriber: Transcriber { model.transcriber }
-    private var blocks: [Transcript.Block] { Transcript.parse(item.transcriptText) }
+    private let blocks: [Transcript.Block]
     private var shownBlocks: [(offset: Int, element: Transcript.Block)] {
         let all = Array(blocks.enumerated())
         guard !query.isEmpty else { return all }
@@ -61,12 +62,6 @@ struct DetailView: View {
         }
         .focusable()
         .focusEffectDisabled()
-        .onKeyPress(.space) {
-            // A space typed into the title, a tag or a search box is text, not play.
-            if titleFocused || queryFocused || NSApp.keyWindow?.firstResponder is NSText { return .ignored }
-            player.toggle()
-            return .handled
-        }
         .confirmationDialog("Replace the transcript?", isPresented: $confirmReplace) {
             Button("Transcribe Again") { transcribeAgain() }
             Button("Cancel", role: .cancel) {}
@@ -77,7 +72,11 @@ struct DetailView: View {
             player.load(item.url)
             peaks = await Waveform.peaks(url: item.url, count: 130)
         }
-        .onDisappear { player.stop() }
+        .onDisappear {
+            // Another row was clicked while the title was being edited: keep the new name.
+            if title.normalizedSpaces != item.displayTitle.normalizedSpaces, FileManager.default.fileExists(atPath: item.url.path) { commitTitle() }
+            player.unload(item.url)
+        }
     }
 
     // MARK: Header
@@ -184,11 +183,11 @@ struct DetailView: View {
 
     private var tabs: some View {
         HStack(alignment: .center, spacing: 22) {
-            tabButton("Transcript", .transcript)
-            tabButton("Details", .details)
-            Spacer()
+            tabButton("Transcript", .transcript).fixedSize()  // the tabs keep their width; the search field gives way
+            tabButton("Details", .details).fixedSize()
+            Spacer(minLength: 12)
             if tab == .transcript && !blocks.isEmpty {
-                SearchField(prompt: "Search transcript...", text: $query, focus: $queryFocused).frame(width: 260)
+                SearchField(prompt: "Search transcript...", text: $query, focus: $queryFocused).frame(minWidth: 140, maxWidth: 260)
             }
         }
         .frame(height: 34)
@@ -277,10 +276,23 @@ struct DetailView: View {
     // MARK: Actions
 
     private func commitTitle() {
+        guard !model.library.trashing.contains(item.url) else { return }  // on its way to the Trash: nothing to rename
+        // Unchanged, also when it only differs by what a file name drops ("Meeting ", "Meeting.m4a").
+        guard title.trimmingCharacters(in: .whitespacesAndNewlines).normalizedSpaces != item.displayTitle.normalizedSpaces,
+              Library.cleanName(title) != item.stem else { return title = item.displayTitle }
         // Renaming moves the files a running transcript is about to write next to; wait until it is done.
-        guard title.normalizedSpaces != item.displayTitle.normalizedSpaces else { return title = item.displayTitle }  // unchanged
-        guard transcriber.states[item.url].map(\.isFailure) ?? true, let url = model.library.rename(item, to: title) else { return title = item.displayTitle }
-        onRename(url)
+        guard transcriber.states[item.url].map(\.isFailure) ?? true else {
+            title = item.displayTitle
+            return model.show("Rename it once the transcript is finished.")
+        }
+        guard let url = model.library.rename(item, to: title) else {
+            let problem = model.library.moveProblem
+            if problem != nil { model.library.moveProblem = nil }
+            // An empty name, or one made only of what a file name cannot hold, is no rename at all.
+            if problem != nil || !Library.cleanName(title).isEmpty { model.show(problem ?? "Could not rename \(item.displayTitle).") }
+            return title = item.displayTitle
+        }
+        onRename(item.url, url)
     }
 
     private func copy() {
@@ -323,9 +335,16 @@ struct DetailView: View {
             case .audio:
                 // Exporting onto the recording itself would delete it before the copy: nothing to do then.
                 guard target.standardizedFileURL.resolvingSymlinksInPath() != item.url.standardizedFileURL.resolvingSymlinksInPath() else { return }
-                try? FileManager.default.removeItem(at: target)  // the save panel already asked before replacing
-                try FileManager.default.copyItem(at: item.url, to: target)
-                Register.clear(target)
+                // A copy next to the target first, then a swap: a failed copy leaves the file that was there.
+                let copy = target.deletingLastPathComponent().appending(path: ".\(UUID().uuidString).m4a")
+                try FileManager.default.copyItem(at: item.url, to: copy)
+                Register.clear(copy)
+                do {
+                    if FileManager.default.fileExists(atPath: target.path) { _ = try FileManager.default.replaceItemAt(target, withItemAt: copy, options: .usingNewMetadataOnly) } else { try FileManager.default.moveItem(at: copy, to: target) }
+                } catch {
+                    try? FileManager.default.removeItem(at: copy)
+                    throw error
+                }
             }
         } catch {
             model.show("Export failed: \(error.localizedDescription)")
@@ -485,10 +504,11 @@ private struct TagBar: View {
     @State private var draft = ""
 
     var body: some View {
-        HStack(spacing: 6) {
+        Flow(spacing: 6) {  // wraps: many tags in a narrow window stay whole
             ForEach(item.tags, id: \.self) { tag in
                 Text(tag)
                     .font(.callout)
+                    .lineLimit(1)
                     .padding(.horizontal, 9)
                     .padding(.vertical, 3)
                     .background(RoundedRectangle(cornerRadius: 6).fill(Theme.card))

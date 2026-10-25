@@ -152,6 +152,12 @@ final class Capture: @unchecked Sendable {
     private var procID: AudioDeviceIOProcID?
     private var listeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
 
+    /// Whether the default output is running, when that is not only this capture's doing (a headset is mic and output in one).
+    func outputIsPlayingElsewhere() -> Bool {
+        guard let output = try? get(systemObject, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, AudioDeviceID(0)), output != mic else { return false }
+        return ((try? get(output, kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioObjectPropertyScopeGlobal, UInt32(0))) ?? 0) != 0
+    }
+
     static let faultText = [1: "the audio devices changed while recording", 2: "the recording buffer overflowed", 3: "a gap in the audio stream was too long", 4: "writing to disk failed"]
 
     init(url: URL) throws {

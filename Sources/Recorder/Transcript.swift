@@ -174,7 +174,7 @@ enum Transcript {
         }
         words.removeAll { $0 == "-" || $0 == "–" }  // dialogue markers some models print
         let count = words.count
-        words = collapseRepeats(words)
+        words = collapseRepeats(words, oneWord: language == "en")
         struck.repeatedWords += count - words.count
         guard !words.isEmpty else { return "" }
         var text = words.joined(separator: " ")
@@ -189,15 +189,17 @@ enum Transcript {
     }
 
     /// "I think I think it is it is fine" becomes "I think it is fine": repeats of 1 to 6 words, until none are left.
-    static func collapseRepeats(_ input: [String]) -> [String] {
+    /// Words are compared with their punctuation ("It works. It works on" is two sentences, not a stutter), and a
+    /// single repeated word only in English: "sık sık" or "yavaş yavaş" in Turkish is one word said twice on purpose.
+    static func collapseRepeats(_ input: [String], oneWord: Bool = true) -> [String] {
         var words = input
         var changed = true
         while changed {
             changed = false
-            for n in stride(from: 6, through: 1, by: -1) {
+            for n in stride(from: 6, through: oneWord ? 1 : 2, by: -1) {
                 var i = 0
                 while i + 2 * n <= words.count {
-                    if (0..<n).allSatisfy({ normal(words[i + $0]) == normal(words[i + n + $0]) }) {
+                    if (0..<n).allSatisfy({ words[i + $0].lowercased() == words[i + n + $0].lowercased() }) {
                         words.removeSubrange(i + n..<i + 2 * n)
                         changed = true
                     } else {
@@ -242,6 +244,8 @@ enum Transcript {
         let en = Locale(identifier: "en")
 
         expect(collapseRepeats("I think I think it is it is fine".split(separator: " ").map(String.init)).joined(separator: " ") == "I think it is fine", "collapse repeats")
+        expect(collapseRepeats("It works. It works on my machine.".split(separator: " ").map(String.init)).joined(separator: " ") == "It works. It works on my machine.", "two sentences are not a stutter")
+        expect(tidy(Segment(start: 0, end: 3, text: " sık sık geliyor, yavaş yavaş."), language: "tr", locale: Locale(identifier: "tr")) == "Sık sık geliyor, yavaş yavaş.", "Turkish doubled words stay")
         expect(tidy(Segment(start: 0, end: 3, text: " um so hello, there"), language: "en", locale: en) == "So hello, there.", "filler and full stop")
         expect(tidy(Segment(start: 0, end: 3, text: " - so hello there"), language: "en", locale: en) == "so hello there", "dialogue dash dropped, unpunctuated text left alone")
         expect(tidy(Segment(start: 0, end: 3, text: " fine, and i agree,"), language: "en", locale: en) == "Fine, and I agree.", "capital I and trailing comma")

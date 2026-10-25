@@ -17,7 +17,7 @@ Kagu is a small Mac app with one record button. It records your microphone and e
 ## 3. How to record
 
 1. `./build.sh`, then open `Kagu.app`.
-2. Press the red button (or New Recording, ⌘N). A live row at the top of the list shows the time and the level; press again to stop. Pause is ⇧⌘P: nothing is written while paused, the mic stays open. While recording, a small dark Recording window shows the time, a moving waveform, Pause, Stop (⌘.) and a button back to the library.
+2. Press the red button (or New Recording, ⌘N). A live row at the top of the list shows the time and the level; press the button again (or Stop Recording, ⌘.) to stop. ⌘N never stops a recording. Pause is ⇧⌘P: nothing is written while paused, the mic stays open. While recording, a small dark Recording window shows the time, a moving waveform, Pause, Stop (⌘.) and a button back to the library.
 3. Saving takes about 80 s per recorded hour on an M4 Pro. For a long recording the live row says how long saving should take on this Mac (the median of its last five saves) and says so if it is still saving past that.
 4. The new recording is selected. Without a transcript it has one Transcribe button; the first time it downloads the speech model once. A transcript has Copy (speaker, time, text); click a time to play from there. Space plays and pauses (also Playback, ⌥Space). Export... saves the transcript as Markdown or text, or a copy of the audio.
 5. File, Transcribe Audio File (⇧⌘T) makes a transcript of any audio file, next to it.
@@ -28,6 +28,7 @@ The menu bar item (on by default, Settings, General) has New Recording, Stop Rec
 
 - With speakers, the echo of the other side on your mic drops about 20 dB once learned. The first ~5 s of a call keep more echo while it learns. Loud, distorted speakers, Bluetooth or AirPlay speakers (over 150 ms delay) and system audio that contains your own voice are not cancelled well. Headphones avoid all of it.
 - FaceTime and other apps that use Apple's voice processing mute the mic for every other app while they run. Kagu warns "No sound from the mic". Meet in Chrome and Discord do not do this.
+- If an app plays for a minute and Kagu hears nothing of it, it warns "No sound from the Mac yet": the System Audio Recording permission is missing.
 - Everything the Mac plays is recorded, notification sounds included.
 - With AirPods: if no call is using the AirPods mic, Kagu uses the built-in mic, so your headphones stay in high quality. If a call uses the AirPods mic, Kagu uses it too and stops (saving the file) when the call releases it. A sample rate change mid recording also stops and saves.
 - When something goes wrong, the notice says what happened and, under it, where it was written down: "Condition report: line 1204 of Recorder.log." (`~/Library/Logs/Recorder.log`).

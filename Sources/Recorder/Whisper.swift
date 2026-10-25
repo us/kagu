@@ -110,7 +110,8 @@ enum Whisper {
             struct Item: Decodable { let offsets: Offsets; let text: String }
             let transcription: [Item]
         }
-        let file = try JSONDecoder().decode(File.self, from: Data(contentsOf: json))
+        // whisper.cpp can cut a multi-byte character between two segments; a strict decode would refuse the whole file.
+        let file = try JSONDecoder().decode(File.self, from: Data(String(decoding: try Data(contentsOf: json), as: UTF8.self).utf8))
         return file.transcription.map { Segment(start: Double($0.offsets.from) / 1000, end: Double($0.offsets.to) / 1000, text: $0.text) }
     }
 }
