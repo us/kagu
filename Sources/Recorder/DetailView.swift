@@ -18,6 +18,7 @@ struct DetailView: View {
     @State private var tab = CommandLine.arguments.contains("--details") ? Tab.details : .transcript  // `--details` is a test aid
     @State private var query = ""
     @State private var confirmReplace = false
+    @State private var editingTitle = false
     @FocusState private var titleFocused: Bool
     @FocusState private var queryFocused: Bool
 
@@ -96,23 +97,37 @@ struct DetailView: View {
 
     private var titleRow: some View {
         HStack(alignment: .center, spacing: 10) {
-            // A hidden copy of the title sizes the field, so the pencil sits right after the text.
+            // The title is text; a click, the pencil or Rename puts a field over it, sized by the text, so the
+            // pencil sits right after it. A field left on screen kept a height it once measured wrong (15 pt for
+            // the 28 pt title, the lower half of the title cut off), so the field is only there while editing.
             Text(title.isEmpty ? "Title" : title)
                 .font(Theme.title.weight(.bold))
                 .lineLimit(1)
                 .padding(.trailing, 10)  // the text field draws a few points wider than the text
-                .hidden()
+                .opacity(editingTitle ? 0 : 1)
+                .onTapGesture { editingTitle = true }
+                .accessibilityHidden(editingTitle)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint("Press to rename")
+                .accessibilityAction { editingTitle = true }
                 .overlay(alignment: .leading) {
-                    TextField("Title", text: $title)
-                        .textFieldStyle(.plain)
-                        .font(Theme.title.weight(.bold))
-                        .focused($titleFocused)
-                        .onSubmit(commitTitle)
-                        .accessibilityHint("Edit and press Return to rename")
-                        .onChange(of: titleFocused) { _, focused in if !focused { commitTitle() } }
+                    if editingTitle {
+                        TextField("Title", text: $title)
+                            .textFieldStyle(.plain)
+                            .font(Theme.title.weight(.bold))
+                            .focused($titleFocused)
+                            .onAppear { Task { @MainActor in titleFocused = true } }  // after the field is in the window, and after a menu closes
+                            .onSubmit { titleFocused = false }
+                            .accessibilityHint("Edit and press Return to rename")
+                            .onChange(of: titleFocused) { _, focused in
+                                guard !focused else { return }
+                                editingTitle = false
+                                commitTitle()
+                            }
+                    }
                 }
                 .clipped()
-            Button { titleFocused = true } label: { Image(systemName: "pencil") }
+            Button { editingTitle = true } label: { Image(systemName: "pencil") }
                 .buttonStyle(.plain).foregroundStyle(.secondary).help("Rename").accessibilityLabel("Rename")
         }
     }
@@ -147,7 +162,7 @@ struct DetailView: View {
             .fixedSize()
             Menu {
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
-                Button("Rename") { titleFocused = true }
+                Button("Rename") { editingTitle = true }
                 Divider()
                 Button("Move to Trash") {
                     transcriber.cancel(item.url)  // a job for a recording that is going away would only leave an orphan transcript
