@@ -7,6 +7,21 @@ enum Selftest {
     static func run() async -> [String] {
         var failures = Transcript.selfTest()
         func expect(_ ok: Bool, _ what: String) { if !ok { failures.append(what) } }
+
+        // Turns: the far side in the mic is bleed, your own words are kept; words go to the stretch they were said in
+        var far = [Float](repeating: -100, count: 600), mic = [Float](repeating: -60, count: 600)
+        for i in 0..<200 { far[i] = -20; mic[i] = -35 }  // the far side, and its bleed 15 dB under it
+        for i in 300..<400 { mic[i] = -30 }  // you, with the Mac quiet
+        let turns = Turns.speech(me: mic, them: far)
+        expect(turns.me.count == 1 && turns.me[0].lowerBound >= 290 && turns.me[0].upperBound <= 410, "bleed is not your speech: \(turns.me)")
+        expect(turns.them == [0..<205], "the far side is one stretch: \(turns.them)")
+        let chunks = [Turns.Chunk(packed: 0, start: 10, length: 2), Turns.Chunk(packed: 3.5, start: 20, length: 1)]
+        let said = Turns.segments(words: [(0.5, "Hey,"), (1.9, "man."), (3.2, "How"), (2.6, "Thanks."), (4.0, "are")], chunks: chunks)
+        expect(said == [Segment(start: 10, end: 12, text: "Hey, man."), Segment(start: 20, end: 21, text: "How are")], "words land in their stretch, one made up in the silence is dropped: \(said)")
+        let heard = Transcript.merge([("You", [Segment(start: 3, end: 4, text: "Yeah."), Segment(start: 12, end: 13, text: "Yeah.")]), ("Them", [Segment(start: 0, end: 10, text: "So we ship it on Friday.")])], language: "en")
+        expect(heard.lines.map(\.text) == ["So we ship it on Friday.", "Yeah."] && heard.struck.fillers == 1, "a yeah said while they talk is listening, a yeah after is an answer: \(heard.lines.map(\.text))")
+        let both = Transcript.merge([("You", [Segment(start: 0, end: 0.4, text: "Yeah.")]), ("Them", [Segment(start: 0, end: 0.6, text: "Okay.")])], language: "en")
+        expect(both.lines.count == 2 && both.struck.fillers == 0, "a yeah inside their okay is kept: \(both.lines.map(\.text))")
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appending(path: "recorder-selftest-\(UUID().uuidString)")
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)

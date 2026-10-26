@@ -52,10 +52,24 @@ enum Whisper {
     /// short; the result was checked against `-mc 0` on a 68 minute meeting (same terms found).
     /// `--vad` skips silence, so it cannot invent text there; the segment times in the JSON are on
     /// the original timeline (token times are not, so they are not used).
+    ///
+    /// Two tracks (your mic, then the Mac audio) take another way: `Turns` cuts them into stretches of
+    /// speech by their levels, and each side's stretches go to Whisper packed into one file. `--vad` would
+    /// glue the stretches of a quick exchange into one long segment per side; instead each word's DTW time
+    /// (`-dtw` needs `-nfa`) says which stretch it was spoken in, and a stretch keeps its real start.
     static func run(model: URL, tracks: [URL], language: String, handle: WhisperProcess, progress: @escaping @Sendable (Double) -> Void) async throws -> [[Segment]] {
         guard let binary, let vad = vadModel else { throw RecorderError("The transcription engine is missing from the app.") }
-        var arguments = ["-m", model.path, "-l", language, "-mc", "20", "--carry-initial-prompt", "--prompt", prompt(for: language), "--vad", "-vm", vad.path, "-oj", "-pp"]
-        for track in tracks { arguments += ["-f", track.path] }
+        var arguments = ["-m", model.path, "-l", language, "-mc", "20", "--carry-initial-prompt", "--prompt", prompt(for: language), "-pp"]
+        let turns = tracks.count == 2 ? try await Task.detached { try Turns.pack(me: tracks[0], them: tracks[1]) }.value : nil
+        let files = turns.map { $0.filter { !$0.chunks.isEmpty }.map(\.wav) } ?? tracks
+        if turns != nil {
+            arguments += ["-nfa", "-dtw", model.lastPathComponent.contains("turbo") ? "large.v3.turbo" : "large.v3", "-ojf"]
+        } else {
+            arguments += ["--vad", "-vm", vad.path, "-oj"]
+        }
+        for file in files { arguments += ["-f", file.path] }
+        if handle.isCancelled { throw CancellationError() }  // cancelled while the tracks were read
+        if files.isEmpty { return tracks.map { _ in [] } }  // nobody spoke
 
         let process = Process()
         process.executableURL = binary
@@ -65,7 +79,7 @@ enum Whisper {
         process.standardError = errors
         process.standardOutput = FileHandle.nullDevice
 
-        let state = Mutex(ProgressState(total: tracks.count))
+        let state = Mutex(ProgressState(total: files.count))
         defer { errors.fileHandleForReading.readabilityHandler = nil }
         errors.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -94,7 +108,10 @@ enum Whisper {
             log("whisper exited with \(status): \(tail)")
             throw RecorderError("Transcription stopped unexpectedly. Try again.")
         }
-        return try tracks.map { try segments(in: URL(fileURLWithPath: $0.path + ".json")) }
+        guard let turns else { return try tracks.map { try segments(in: URL(fileURLWithPath: $0.path + ".json")) } }
+        return try turns.map { side in
+            side.chunks.isEmpty ? [] : Turns.segments(words: try words(in: URL(fileURLWithPath: side.wav.path + ".json")), chunks: side.chunks)
+        }
     }
 
     /// A short sentence with punctuation, in the language it nudges. Other languages get the English one:
@@ -113,6 +130,36 @@ enum Whisper {
         // whisper.cpp can cut a multi-byte character between two segments; a strict decode would refuse the whole file.
         let file = try JSONDecoder().decode(File.self, from: Data(String(decoding: try Data(contentsOf: json), as: UTF8.self).utf8))
         return file.transcription.map { Segment(start: Double($0.offsets.from) / 1000, end: Double($0.offsets.to) / 1000, text: $0.text) }
+    }
+
+    /// Reads the words and their DTW times (seconds in the file) from whisper's `-ojf` file. The words come from
+    /// the segment text, which holds whole characters; the tokens only give the times (a token starting with a
+    /// space starts a word; one without a time takes the time before it).
+    static func words(in json: URL) throws -> [(time: Double, text: String)] {
+        struct File: Decodable {
+            struct Offsets: Decodable { let from: Int }
+            struct Token: Decodable { let text: String; let t_dtw: Int?; let offsets: Offsets? }
+            struct Item: Decodable { let text: String; let tokens: [Token] }
+            let transcription: [Item]
+        }
+        let file = try JSONDecoder().decode(File.self, from: Data(String(decoding: try Data(contentsOf: json), as: UTF8.self).utf8))
+        var words: [(time: Double, text: String)] = []
+        var last = 0.0
+        for item in file.transcription {
+            var times: [Double] = []
+            for token in item.tokens where !token.text.hasPrefix("[_") {
+                // The DTW time; without one, the token's own (rougher) time, so the words still spread over the stretches.
+                if let t = token.t_dtw, t >= 0 { last = Double(t) / 100 } else if let from = token.offsets?.from { last = Double(from) / 1000 }
+                if token.text.hasPrefix(" ") || times.isEmpty { times.append(last) }
+            }
+            let texts = item.text.split(separator: " ").map(String.init)
+            guard !times.isEmpty else { continue }
+            // Normally one time per word; if the counts differ, the times are spread over the words in order.
+            // ponytail: a language written without spaces (Chinese, Japanese) gives one word per segment, so a segment
+            // stays in one stretch; split by token bytes if those languages matter.
+            for (k, text) in texts.enumerated() { words.append((times[k * times.count / max(1, texts.count)], text)) }
+        }
+        return words
     }
 }
 

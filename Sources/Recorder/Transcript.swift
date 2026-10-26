@@ -46,6 +46,8 @@ enum Transcript {
 
     /// Only English "language" fillers: `er` or `mm` are real words in other languages.
     private static let fillers: Set<String> = ["um", "umm", "uh", "uhm", "hmm", "mhm"]
+    /// What a listener says while the other side talks.
+    private static let backchannels: Set<String> = ["yeah", "yes", "yep", "mmhmm", "uhhuh", "mhm", "hmm", "okay", "ok", "right", "sure"]
     private static let silenceInventions: Set<String> = ["you", "thank you", "thanks for watching", "bye"]
     private static let joinGap = 3.0  // seconds of silence that start a new paragraph
     private static let paragraphLimit = 450  // characters; a longer paragraph starts a new one at the next segment
@@ -78,6 +80,22 @@ enum Transcript {
         }
         if tracks.count == 2 { struck.echoOf = tracks[1].speaker }
         items.sort { $0.segment.start < $1.segment.start }
+        if language == "en" || language == "auto" {
+            // "Yeah" or "mm-hmm" said while the other side talks is listening, not a turn; kept, it cuts their paragraph up.
+            let short = Set(items.indices.filter { i in
+                let words = items[i].segment.text.split(whereSeparator: \.isWhitespace).map { normal(String($0)) }
+                return words.count <= 3 && words.allSatisfy(backchannels.contains)
+            })
+            // Only a real turn of the other side can hold one: both saying "okay" or "yeah" at once, neither is dropped.
+            let listening = short.filter { i in
+                items.indices.contains {
+                    !short.contains($0) && items[$0].speaker != items[i].speaker
+                        && items[$0].segment.start <= items[i].segment.start && items[$0].segment.end >= items[i].segment.end
+                }
+            }
+            for i in listening { struck.fillers += items[i].segment.text.split(whereSeparator: \.isWhitespace).count }
+            items = items.indices.filter { !listening.contains($0) }.map { items[$0] }
+        }
 
         var lines: [Line] = []
         var lastEnd = 0.0
@@ -89,7 +107,7 @@ enum Transcript {
             }
             lastEnd = item.segment.end
         }
-        return (lines, struck)
+        return (lines.map { Line(speaker: $0.speaker, start: $0.start, text: finish($0.text, language: language, locale: locale)) }, struck)
     }
 
     /// The line that separates the passages from the note at the foot.
@@ -177,11 +195,17 @@ enum Transcript {
         words = collapseRepeats(words, oneWord: language == "en")
         struck.repeatedWords += count - words.count
         guard !words.isEmpty else { return "" }
-        var text = words.joined(separator: " ")
-        // Whisper punctuates some stretches and not others. A segment is cut at a pause, often mid
-        // sentence, so a capital and a full stop are only added where Whisper punctuated it itself.
-        guard text.contains(where: { ".,?!".contains($0) }) else { return text }
-        if language == "en" { text = words.map { $0 == "i" ? "I" : $0 }.joined(separator: " ") }
+        let text = words.joined(separator: " ")
+        guard language == "en", text.contains(where: { ".,?!".contains($0) }) else { return text }
+        return words.map { $0 == "i" ? "I" : $0 }.joined(separator: " ")
+    }
+
+    /// Whisper punctuates some stretches and not others, and a segment is often cut mid sentence ("but I'm" |
+    /// "energized for the week."), so a paragraph, not a segment, gets a capital and a full stop, and only where
+    /// Whisper punctuated it itself.
+    static func finish(_ paragraph: String, language: String, locale: Locale) -> String {
+        guard paragraph.contains(where: { ".,?!".contains($0) }) else { return paragraph }
+        var text = paragraph
         if language != "auto" { text = text.prefix(1).uppercased(with: locale) + text.dropFirst() }  // "iyi" needs the Turkish rule
         if let last = text.last, ",;:".contains(last) { text.removeLast() }
         if let last = text.last, !".?!…".contains(last) { text += "." }
@@ -245,20 +269,20 @@ enum Transcript {
 
         expect(collapseRepeats("I think I think it is it is fine".split(separator: " ").map(String.init)).joined(separator: " ") == "I think it is fine", "collapse repeats")
         expect(collapseRepeats("It works. It works on my machine.".split(separator: " ").map(String.init)).joined(separator: " ") == "It works. It works on my machine.", "two sentences are not a stutter")
-        expect(tidy(Segment(start: 0, end: 3, text: " sık sık geliyor, yavaş yavaş."), language: "tr", locale: Locale(identifier: "tr")) == "Sık sık geliyor, yavaş yavaş.", "Turkish doubled words stay")
-        expect(tidy(Segment(start: 0, end: 3, text: " um so hello, there"), language: "en", locale: en) == "So hello, there.", "filler and full stop")
+        expect(finish(tidy(Segment(start: 0, end: 3, text: " sık sık geliyor, yavaş yavaş."), language: "tr", locale: Locale(identifier: "tr")), language: "tr", locale: Locale(identifier: "tr")) == "Sık sık geliyor, yavaş yavaş.", "Turkish doubled words stay")
+        expect(finish(tidy(Segment(start: 0, end: 3, text: " um so hello, there"), language: "en", locale: en), language: "en", locale: en) == "So hello, there.", "filler and full stop")
         expect(tidy(Segment(start: 0, end: 3, text: " - so hello there"), language: "en", locale: en) == "so hello there", "dialogue dash dropped, unpunctuated text left alone")
-        expect(tidy(Segment(start: 0, end: 3, text: " fine, and i agree,"), language: "en", locale: en) == "Fine, and I agree.", "capital I and trailing comma")
+        expect(finish(tidy(Segment(start: 0, end: 3, text: " fine, and i agree,"), language: "en", locale: en), language: "en", locale: en) == "Fine, and I agree.", "capital I and trailing comma")
         expect(tidy(Segment(start: 0, end: 25, text: " Thank you."), language: "en", locale: en) == "", "silence invention")
         expect(tidy(Segment(start: 0, end: 3, text: " Thank you."), language: "en", locale: en) == "Thank you.", "real thank you stays")
-        expect(tidy(Segment(start: 0, end: 3, text: " iyi günler, hepinize"), language: "tr", locale: Locale(identifier: "tr")) == "İyi günler, hepinize.", "Turkish capital i")
-        expect(tidy(Segment(start: 0, end: 3, text: " er hat recht, ja"), language: "de", locale: Locale(identifier: "de")) == "Er hat recht, ja.", "German er is kept")
+        expect(finish(tidy(Segment(start: 0, end: 3, text: " iyi günler, hepinize"), language: "tr", locale: Locale(identifier: "tr")), language: "tr", locale: Locale(identifier: "tr")) == "İyi günler, hepinize.", "Turkish capital i")
+        expect(finish(tidy(Segment(start: 0, end: 3, text: " er hat recht, ja"), language: "de", locale: Locale(identifier: "de")), language: "de", locale: Locale(identifier: "de")) == "Er hat recht, ja.", "German er is kept")
 
         let me: [Segment] = [Segment(start: 0, end: 4, text: "so what we have here today"), Segment(start: 10, end: 14, text: "yes that works for me,"), Segment(start: 15, end: 17, text: "and one more thing.")]
         let them: [Segment] = [Segment(start: 1, end: 5, text: "so what we have here today is a tool"), Segment(start: 30, end: 34, text: "great")]
         let lines = merge([("Me", me), ("Them", them)], language: "en").lines
         expect(lines.map(\.speaker) == ["Them", "Me", "Them"], "echo dropped, order kept, same speaker joined: \(lines.map(\.speaker))")
-        expect(lines.count == 3 && lines[1].text == "Yes that works for me. And one more thing.", "me lines joined: \(lines.map(\.text))")
+        expect(lines.count == 3 && lines[1].text == "Yes that works for me, and one more thing.", "me lines joined: \(lines.map(\.text))")
         let rendered = render([Line(speaker: "Me", start: 3, text: "Hello there."), Line(speaker: "Them", start: 3725, text: "Fine, thanks.")], title: "t", model: "m", language: "en", date: Date())
         expect(parse(rendered) == [Block(speaker: "Me", seconds: 3, text: "Hello there."), Block(speaker: "Them", seconds: 3725, text: "Fine, thanks.")], "parse reads back render: \(parse(rendered))")
         let copied = plainText(title: "t", date: Date(timeIntervalSince1970: 0), blocks: [Block(speaker: "Me", seconds: 3, text: "Hello."), Block(speaker: "Them", seconds: 65, text: "Hi.")])
