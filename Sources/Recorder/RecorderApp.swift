@@ -31,6 +31,7 @@ struct RecorderApp: App {
                 Button("About Kagu") {
                     NSApp.orderFrontStandardAboutPanel(options: [.credits: NSAttributedString(string: "Kagu. Rhynochetos jubatus. Sings in pairs.", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])])
                 }
+                Button("Check for Updates...") { Updater.shared?.check() }
             }
             CommandMenu("Playback") {
                 Button("Play or Pause") { delegate.model.player.toggle() }.keyboardShortcut(.space, modifiers: .option)
@@ -62,7 +63,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Scripted runs: `--record <seconds>` presses record on launch, stops and quits after N seconds.
         let args = CommandLine.arguments
         let scripted = ["--selftest", "--record", "--download", "--tag", "--play", "--transcribe-file", "--transcribe-raw"]
-        if !args.contains(where: scripted.contains) { calls.start() }
+        if !args.contains(where: scripted.contains) {
+            calls.start()
+            Updater.shared = Updater(model: model)
+        }
         // Test aid: `--appearance light|dark` forces the look of the whole app.
         if let i = args.firstIndex(of: "--appearance"), i + 1 < args.count {
             NSApp.appearance = NSAppearance(named: args[i + 1] == "light" ? .aqua : .darkAqua)
@@ -162,6 +166,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // An update quits only when idle, but a transcript may have been asked for since: let it finish first.
+        if model.updating, model.transcriber.isBusy {
+            model.transcriber.whenIdle { NSApp.reply(toApplicationShouldTerminate: true) }
+            return .terminateLater
+        }
         model.transcriber.shutDown()  // the engine is a child process: it must not outlive the app
         guard model.state != .idle || model.isRecovering else { return .terminateNow }
         model.stop()
@@ -205,7 +214,9 @@ final class Recorder {
     private var meterTimer: Timer?
     private var ticks = 0
     private var bluetoothMicWasInUse = false
-    private var starting = false  // true while waiting for the mic permission answer
+    private(set) var starting = false  // true while waiting for the mic permission answer
+    /// Set while an update installs: Kagu is about to quit, so nothing new starts.
+    var updating = false
     private var idleWaiters: [() -> Void] = []
     /// Converting a recording left by a crash. Separate from `state`, so it never keeps a new recording from starting.
     private(set) var isRecovering = false
@@ -245,6 +256,7 @@ final class Recorder {
     }
 
     func start() async {
+        if updating { return fail("Kagu is installing an update and opens again in a moment.") }
         guard state == .idle, !starting else { log("start ignored: \(state)"); return }
         starting = true
         defer { starting = false }

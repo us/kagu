@@ -8,16 +8,24 @@ IDENTITY="${IDENTITY:-Apple Development: Recep Saritekin (5TTV65YL4S)}"
 swift build -c release
 APP=Kagu.app
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp .build/release/Recorder "$APP/Contents/MacOS/Recorder"
+# Sparkle, the updater: ditto keeps the framework's symlinks. Not sandboxed, so its XPC services are not needed.
+ditto "$(swift build -c release --show-bin-path)/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+rm -rf "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices" "$APP/Contents/Frameworks/Sparkle.framework/XPCServices"
+install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/Recorder"
 cp vendor/whisper-cli "$APP/Contents/MacOS/whisper-cli"
 cp vendor/ggml-silero-v5.1.2.bin vendor/LICENSE-whisper.cpp "$APP/Contents/Resources/"
 cp Info.plist "$APP/Contents/Info.plist"
 # The app icon: light, dark and tinted appearances from Resources/AppIcon.icon (scripts/make-icon.py makes it).
 xcrun actool Resources/AppIcon.icon --compile "$APP/Contents/Resources" --platform macosx --minimum-deployment-target 15.0 \
     --app-icon AppIcon --output-partial-info-plist .build/icon-partial.plist >/dev/null
-# The helper is signed first: signing the app does not sign nested executables.
+# Nested code is signed first, inside out: signing the app does not sign it.
 codesign --force --sign "$IDENTITY" "$APP/Contents/MacOS/whisper-cli"
+SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+codesign --force --sign "$IDENTITY" -o runtime "$SPARKLE/Versions/B/Autoupdate"
+codesign --force --sign "$IDENTITY" -o runtime "$SPARKLE/Versions/B/Updater.app"
+codesign --force --sign "$IDENTITY" -o runtime "$SPARKLE"
 codesign --force --sign "$IDENTITY" "$APP"
 codesign --verify --deep --strict "$APP"
 echo "built $(pwd)/$APP"
