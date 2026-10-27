@@ -28,6 +28,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Kagu records your microphone into the recording. It sends it nowhere.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Kagu checks whether a Chrome tab is in a Google Meet call, to offer to record it. It reads tab addresses, nothing else.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Kagu records the sound this Mac plays (calls, videos) into the same recording. Notification sounds are included.</string>
 </dict>
