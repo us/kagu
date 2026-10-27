@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import SwiftUI
+import UserNotifications
 
 /// "Kagu Settings": a sidebar of five sections, labels on the left and controls on the right.
 struct SettingsView: View {
@@ -221,10 +222,33 @@ private struct AudioSettings: View {
 
 private struct GeneralSettings: View {
     @AppStorage("showMenuBar") private var showMenuBar = true
+    @AppStorage("askToRecordCalls") private var askToRecordCalls = true
+    @State private var notificationsOff = false
 
     var body: some View {
         SettingRow(label: "Menu bar") {
             Toggle("Show Kagu in the menu bar", isOn: $showMenuBar).toggleStyle(.switch).tint(Theme.accent)
+        }
+        SettingRow(label: "Calls") {
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Ask to record when a call starts", isOn: $askToRecordCalls).toggleStyle(.switch).tint(Theme.accent)
+                Text("Zoom, Teams, Slack, Discord, FaceTime, WhatsApp, Webex, and Google Meet in Chrome. When the call ends, Kagu asks to stop and saves after 2 minutes.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if askToRecordCalls, notificationsOff {
+                    Text("Notifications are off for Kagu, so it cannot ask.").font(.caption).foregroundStyle(.orange)
+                    Button("Open Notification Settings") {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=local.recorder")!)
+                    }
+                    .controlSize(.small)
+                }
+            }
+        }
+        .task {
+            // Re-read when Settings comes back to the front, after the owner changed it there.
+            notificationsOff = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
+            for await _ in NotificationCenter.default.notifications(named: NSApplication.didBecomeActiveNotification) {
+                notificationsOff = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
+            }
         }
         SettingRow(label: "Shortcuts") {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 6) {

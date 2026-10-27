@@ -25,6 +25,10 @@ enum Selftest {
         expect(heard.lines.map(\.text) == ["So we ship it on Friday.", "Yeah."] && heard.struck.fillers == 1, "a yeah said while they talk is listening, a yeah after is an answer: \(heard.lines.map(\.text))")
         let both = Transcript.merge([("You", [Segment(start: 0, end: 0.4, text: "Yeah.")]), ("Them", [Segment(start: 0, end: 0.6, text: "Okay.")])], language: "en")
         expect(both.lines.count == 2 && both.struck.fillers == 0, "a yeah inside their okay is kept: \(both.lines.map(\.text))")
+        // Calls: which mic users are a call
+        expect(CallWatcher.callApp("com.hnc.Discord.helper") == "Discord" && CallWatcher.callApp("com.microsoft.teams2") == "Teams" && CallWatcher.callApp("com.apple.CoreSpeech") == nil, "call apps by bundle id")
+        expect(CallWatcher.isChrome("com.google.Chrome.helper") && !CallWatcher.isChrome("com.google.Chrome.canary") && !CallWatcher.isChrome("com.google.Chrome.app.abcdef"), "Chrome, not Canary or a Chrome web app")
+        expect(CallWatcher.isMeet("https://meet.google.com/abc-defg-hij?authuser=0") && !CallWatcher.isMeet("https://meet.google.com/landing") && !CallWatcher.isMeet("https://example.com/?u=https://meet.google.com/abc-defg-hij"), "a Meet call address")
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appending(path: "recorder-selftest-\(UUID().uuidString)")
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)

@@ -56,10 +56,13 @@ struct RecorderApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor let model = Recorder()
+    @MainActor private lazy var calls = CallWatcher(model: model)
 
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
         // Scripted runs: `--record <seconds>` presses record on launch, stops and quits after N seconds.
         let args = CommandLine.arguments
+        let scripted = ["--selftest", "--record", "--download", "--tag", "--play", "--transcribe-file", "--transcribe-raw"]
+        if !args.contains(where: scripted.contains) { calls.start() }
         // Test aid: `--appearance light|dark` forces the look of the whole app.
         if let i = args.firstIndex(of: "--appearance"), i + 1 < args.count {
             NSApp.appearance = NSAppearance(named: args[i + 1] == "light" ? .aqua : .darkAqua)

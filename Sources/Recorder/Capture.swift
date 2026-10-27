@@ -85,6 +85,16 @@ func micInUseByOthers(_ device: AudioDeviceID) -> Bool {
     }
 }
 
+/// Bundle ids of the other processes capturing from any mic right now (a browser's helper reports its own id).
+func micUsers() -> [String] {
+    let me = getpid()
+    return getArray(systemObject, kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyScopeGlobal, AudioObjectID(0)).compactMap { process in
+        guard ((try? get(process, kAudioProcessPropertyIsRunningInput, kAudioObjectPropertyScopeGlobal, UInt32(0))) ?? 0) != 0,
+              (try? get(process, kAudioProcessPropertyPID, kAudioObjectPropertyScopeGlobal, pid_t(0))) != me else { return nil }
+        return getString(process, kAudioProcessPropertyBundleID)
+    }
+}
+
 private func isBluetooth(_ device: AudioDeviceID) -> Bool {
     let transport = (try? get(device, kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, UInt32(0))) ?? 0
     return transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE
