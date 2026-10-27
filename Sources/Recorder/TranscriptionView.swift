@@ -224,10 +224,20 @@ private struct GeneralSettings: View {
     @AppStorage("showMenuBar") private var showMenuBar = true
     @AppStorage("askToRecordCalls") private var askToRecordCalls = true
     @State private var notificationsOff = false
+    @State private var autoUpdate = Updater.shared?.updater?.automaticallyDownloadsUpdates ?? true
 
     var body: some View {
         SettingRow(label: "Menu bar") {
             Toggle("Show Kagu in the menu bar", isOn: $showMenuBar).toggleStyle(.switch).tint(Theme.accent)
+        }
+        SettingRow(label: "Updates") {
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("Install updates automatically", isOn: $autoUpdate).toggleStyle(.switch).tint(Theme.accent)
+                    .onChange(of: autoUpdate) { _, on in Updater.shared?.updater?.automaticallyDownloadsUpdates = on }
+                Text("Kagu \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""). It waits until nothing is recording or transcribing.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button("Check for Updates...") { Updater.shared?.check() }.controlSize(.small)
+            }
         }
         SettingRow(label: "Calls") {
             VStack(alignment: .leading, spacing: 4) {

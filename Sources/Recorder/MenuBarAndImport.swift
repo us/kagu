@@ -24,6 +24,10 @@ struct MenuBarMenu: View {
             NSApp.activate()
         } label: { Label("Settings...", systemImage: "gearshape") }
             .keyboardShortcut(",")
+        Button {
+            NSApp.activate()
+            Updater.shared?.check()
+        } label: { Label("Check for Updates...", systemImage: "arrow.down.circle") }
         Divider()
         Button { NSApp.terminate(nil) } label: { Label("Quit Kagu", systemImage: "power") }
             .keyboardShortcut("q")
