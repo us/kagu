@@ -12,8 +12,12 @@ enum Theme {
     static let selection = dynamic(light: 0xEF4136, dark: 0xF0473C, alpha: (0.14, 0.24))
     static let raised = dynamic(light: 0xFFFFFF, dark: 0x3A3A3A)  // the round play button
 
-    static let title = Font.system(size: 28, weight: .semibold, design: .serif)
-    static let body = Font.system(size: 14, design: .serif)
+    static let title = Font.system(size: 28, weight: .bold)
+    static let body = Font.system(size: 14)
+
+    /// Finder's tag colors, by the number Finder writes next to a tag's name, in the order its menu shows them.
+    static let tagColors: [(number: Int, color: Color)] = [(6, .red), (7, .orange), (5, .yellow), (2, .green), (4, .blue), (3, .purple), (1, .gray)]
+    static func tagColor(_ number: Int?) -> Color? { tagColors.first { $0.number == number }?.color }
 
     private static func dynamic(light: UInt32, dark: UInt32, alpha: (Double, Double) = (1, 1)) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in

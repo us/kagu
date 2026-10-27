@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var columns = NavigationSplitViewVisibility.all
     @State private var renaming: String?  // the folder whose name is being edited
     @State private var draft = ""
+    @State private var request: DetailRequest?  // Rename or New Tag from a row's menu, for the recording's page
     @FocusState private var searchFocused: Bool
     @FocusState private var listFocused: Bool
     @FocusState private var renameFocused: Bool
@@ -72,6 +73,26 @@ struct ContentView: View {
         return result
     }
 
+    private enum Line {
+        case title(String)
+        case row(RecordingItem, next: URL?)  // next: the recording under it in the same section, for the line between them
+
+        var id: AnyHashable {  // a row by its file, so the scroll proxy finds it by the selection
+            switch self {
+            case .title(let title): AnyHashable("title " + title)
+            case .row(let item, _): AnyHashable(item.id)
+            }
+        }
+    }
+
+    private func lines(_ sections: [(title: String, items: [RecordingItem])]) -> [Line] {
+        sections.flatMap { section in
+            [Line.title(section.title)] + section.items.indices.map { i in
+                .row(section.items[i], next: i + 1 < section.items.count ? section.items[i + 1].id : nil)
+            }
+        }
+    }
+
     private static func section(_ date: Date) -> String {
         let calendar = Calendar.current
         if calendar.isDateInToday(date) { return "Today" }
@@ -104,7 +125,7 @@ struct ContentView: View {
                     EmptyLibrary(model: model)
                 } else if let item = selectedItem {
                     // Only while it is still the one shown: a title committed as another row is clicked must not pull the selection back.
-                    DetailView(item: item, model: model, player: model.player) { old, new in if selection == old { selection = new } }.id(item.id)
+                    DetailView(item: item, model: model, player: model.player, request: $request) { old, new in if selection == old { selection = new } }.id(item.id)
                 } else {
                     ContentUnavailableView("Select a Recording", systemImage: "waveform")
                 }
@@ -140,6 +161,7 @@ struct ContentView: View {
         }
         .onChange(of: isEmpty) { _, empty in columns = empty ? .detailOnly : .all }
         .onChange(of: library.allTags) { _, tags in if case .tag(let chosen) = scope, !tags.contains(chosen) { scope = .all } }
+        .onChange(of: selection) { _, new in if request?.url != new { request = nil } }  // a request left over must not fire on a later visit
         .onChange(of: library.folders) { _, folders in if case .folder(let name?) = scope, !folders.contains(name) { scope = .all } }
         .onChange(of: model.lastFile) { _, file in
             library.reload()
@@ -177,7 +199,7 @@ struct ContentView: View {
                     ForEach(library.folders, id: \.self) { folderRow($0) }
                     if !library.allTags.isEmpty {
                         SidebarHeader(title: "Tags").padding(.top, 14)
-                        TagStrip(tags: library.tagCounts, selected: Binding(
+                        TagStrip(tags: library.tagCounts, colors: library.tagColors, selected: Binding(
                             get: { if case .tag(let tag) = scope { tag } else { nil } },
                             set: { scope = $0.map(Scope.tag) ?? .all }
                         ))
@@ -249,18 +271,21 @@ struct ContentView: View {
                             .padding(.horizontal, 8)
                             .padding(.bottom, 10)
                         }
-                        ForEach(sections, id: \.title) { section in
-                            Text(section.title).font(.system(size: 15, weight: .bold)).padding(.horizontal, 8).padding(.top, 10).padding(.bottom, 6)
-                                .accessibilityAddTraits(.isHeader)
-                            ForEach(Array(section.items.enumerated()), id: \.element.id) { index, item in
+                        // One flat ForEach of titles and rows: with one ForEach per section, a row that changed section (a
+                        // rename, or midnight) was never drawn again, and kept showing itself selected.
+                        ForEach(lines(sections), id: \.id) { line in
+                            switch line {
+                            case .title(let title):
+                                Text(title).font(.system(size: 15, weight: .bold)).padding(.horizontal, 8).padding(.top, 10).padding(.bottom, 6)
+                                    .accessibilityAddTraits(.isHeader)
+                            case .row(let item, let next):
                                 ListRow(item: item, state: transcriber.states[item.url], selected: item.id == selection, showFolder: !isFolderScope && !library.folders.isEmpty)  // with no folders every row would say Recordings
-                                    .id(item.id)
                                     .contentShape(Rectangle())
                                     .onTapGesture { selection = item.id; listFocused = true }
                                     .accessibilityAction { selection = item.id; listFocused = true }  // VoiceOver and keyboard access select it too
                                     .draggable(item.url.path)  // a path, not the file: a drop outside the app cannot take the audio away from its parts
                                     .contextMenu { rowMenu(item) }
-                                if index < section.items.count - 1, item.id != selection, section.items[index + 1].id != selection {
+                                if let next, item.id != selection, next != selection {
                                     Rectangle().fill(Theme.line).frame(height: 1).padding(.horizontal, 12)
                                 }
                             }
@@ -294,6 +319,7 @@ struct ContentView: View {
     private var isFolderScope: Bool { if case .folder = scope { true } else { false } }
 
     @ViewBuilder private func rowMenu(_ item: RecordingItem) -> some View {
+        Button("Rename") { open(item, .rename) }
         if item.transcript == nil, transcriber.states[item.url]?.isFailure ?? true { Button("Transcribe") { transcriber.request(item.url) } }
         Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
         Menu("Move to") {
@@ -304,13 +330,40 @@ struct ContentView: View {
             Button("New Folder...") { if let name = library.createFolder() { _ = move([item.url], to: name); draft = name; renaming = name } }
         }
         Divider()
+        // Finder's color dots, then every other tag in the library; each one switches on or off.
+        ControlGroup {
+            ForEach(Theme.tagColors, id: \.number) { tag in
+                if let name = Library.colorTagName(tag.number) {
+                    Toggle(isOn: tagBinding(item, name)) { Label(name, systemImage: "circle.fill") }.tint(tag.color)
+                }
+            }
+        }
+        .controlGroupStyle(.palette)
+        Menu("Tags") {
+            let colorNames = Set(Theme.tagColors.compactMap { Library.colorTagName($0.number) })
+            let others = library.allTags.filter { !colorNames.contains($0) }
+            ForEach(others, id: \.self) { tag in Toggle(tag, isOn: tagBinding(item, tag)) }
+            if !others.isEmpty { Divider() }
+            Button("New Tag...") { open(item, .tag) }
+        }
+        Divider()
         Button("Move to Trash") { trash(item) }
+    }
+
+    private func tagBinding(_ item: RecordingItem, _ tag: String) -> Binding<Bool> {
+        Binding(get: { item.tags.contains(tag) }, set: { library.setTag(tag, $0, for: item.url) })
+    }
+
+    /// Selects the recording and opens its title field or its tag editor on its page.
+    private func open(_ item: RecordingItem, _ kind: DetailRequest.Kind) {
+        selection = item.id
+        request = DetailRequest(url: item.url, kind: kind)
     }
 
     // MARK: Actions
 
-    /// Moving is refused while the app saves or while a transcript of that recording runs: either one writes
-    /// next to the file's current place.
+    /// A folder is renamed or deleted only while nothing writes next to its recordings: the app saving, or a
+    /// transcript of one of them. (A recording itself can move: its transcript follows it.)
     private func canChange(_ item: RecordingItem) -> Bool {
         model.state != .saving && (transcriber.states[item.url].map(\.isFailure) ?? true)
     }
@@ -318,8 +371,8 @@ struct ContentView: View {
     private func move(_ urls: [URL], to name: String?) -> Bool {
         let items = urls.compactMap { url in library.items.first { $0.url.standardizedFileURL == url.standardizedFileURL } }.filter { $0.folder != name }
         guard !items.isEmpty else { return false }
-        guard items.allSatisfy(canChange) else {
-            model.show("Wait until saving or the transcript is finished, then move it.")
+        guard model.state != .saving else {
+            model.show("Wait until saving is finished, then move it.")
             return false
         }
         var failed: [String] = []
@@ -475,7 +528,12 @@ private struct ListRow: View {
                 if showFolder || !item.tags.isEmpty {
                     HStack(spacing: 8) {
                         if showFolder { Label(item.folder ?? "Recordings", systemImage: "folder") }
-                        if !item.tags.isEmpty { Text(item.tags.map { "#\($0)" }.joined(separator: " ")) }
+                        ForEach(item.tags, id: \.self) { tag in
+                            HStack(spacing: 3) {
+                                if let color = Theme.tagColor(item.colors[tag]) { Circle().fill(color).frame(width: 7, height: 7) }
+                                Text(tag)
+                            }
+                        }
                     }
                     .font(.caption).foregroundStyle(secondary).lineLimit(1)
                 }
@@ -500,9 +558,9 @@ private struct EmptyLibrary: View {
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "waveform").font(.system(size: 64, weight: .light)).foregroundStyle(.secondary)
-            Text("No Recordings Yet").font(.system(size: 30, weight: .bold, design: .serif))
+            Text("No Recordings Yet").font(.system(size: 30, weight: .bold))
             Text("Click the record button to capture\nyour first conversation.")
-                .font(.system(size: 18, design: .serif)).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(2)
+                .font(.system(size: 18)).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(2)
             RecordButton(model: model, label: "Start Recording", size: 72).padding(.top, 14)
             Text(register.total == 0 ? "Register is empty. Next accession: \(register.next(for: Date()))." : "No entries on file. \(register.total) withdrawn. Next accession: \(register.next(for: Date())).")
                 .font(.caption).foregroundStyle(.tertiary).padding(.top, 18)
@@ -646,6 +704,7 @@ private struct OutsideRow: View {
 /// Every tag in the library as a chip with its count; one click shows only those recordings, a second click all.
 private struct TagStrip: View {
     let tags: [(tag: String, count: Int)]
+    let colors: [String: Int]
     @Binding var selected: String?
 
     var body: some View {
@@ -654,6 +713,7 @@ private struct TagStrip: View {
                 let on = selected == item.tag
                 Button { selected = on ? nil : item.tag } label: {
                     HStack(spacing: 4) {
+                        if let color = Theme.tagColor(colors[item.tag]) { Circle().fill(color).frame(width: 7, height: 7) }
                         Text(item.tag).lineLimit(1)
                         Text("\(item.count)").foregroundStyle(on ? Theme.accent : Color.secondary).monospacedDigit()
                     }

@@ -8,11 +8,23 @@ import UniformTypeIdentifiers
 @MainActor @Observable
 final class Transcriber {
     struct Job {
+        var id = UUID()  // its entry in `places`
         var source: URL  // the recording (or file) the user sees; the state is keyed by it
         var title: String
         var tracks: [(speaker: String, wav: URL)]
         var output: URL
         var cleanup: URL  // deleted when the transcript is written; kept when the app is quit mid-job
+
+        /// The same job for the recording at its new place: the transcript goes next to the new name.
+        func following(_ url: URL) -> Job {
+            let stem = url.deletingPathExtension().lastPathComponent
+            let suffix = output.lastPathComponent.dropFirst(source.deletingPathExtension().lastPathComponent.count)  // ".md", ".transcript.md"
+            var job = self
+            job.source = url
+            job.title = stem
+            job.output = url.deletingLastPathComponent().appending(path: stem + suffix)
+            return job
+        }
     }
 
     enum State: Equatable {
@@ -48,6 +60,9 @@ final class Transcriber {
     private var ownedDownloads: Set<WhisperModel> = []
     /// The latest preparation per recording: one that was cancelled and asked for again must not queue twice.
     private var preparing: [URL: UUID] = [:]
+    /// Where the recording of each request in progress is now (by the request's id): a rename or a move updates it,
+    /// and every step of the job looks its place up here.
+    private var places: [UUID: URL] = [:]
     /// Set by the recorder: a new job does not start while a recording is running (CPU and memory for the capture).
     var shouldPause: () -> Bool = { false }
 
@@ -85,11 +100,14 @@ final class Transcriber {
             waiting[source] = wanted
             models.download(wanted)
             pollers[source]?.cancel()
+            let ticket = UUID()
+            places[ticket] = source
             pollers[source] = Task {
                 while models.state(wanted) != .installed, models.state(wanted) != .missing {
                     try? await Task.sleep(for: .milliseconds(400))
-                    if Task.isCancelled { return }
+                    if Task.isCancelled { places[ticket] = nil; return }
                 }
+                let source = places.removeValue(forKey: ticket) ?? source
                 pollers[source] = nil
                 waiting[source] = nil
                 ownedDownloads.remove(wanted)  // finished or stopped: nothing left to own
@@ -106,7 +124,10 @@ final class Transcriber {
         preparing[source] = nil
         pollers[source]?.cancel()
         pollers[source] = nil
-        for job in queue where job.source == source { try? FileManager.default.removeItem(at: job.cleanup) }
+        for job in queue where job.source == source {
+            try? FileManager.default.removeItem(at: job.cleanup)
+            places[job.id] = nil
+        }
         queue.removeAll { $0.source == source }
         if current?.job.source == source { current?.process.cancel() }
         // Nobody else waits for the model and this request started the download (not Settings): stop it.
@@ -116,6 +137,25 @@ final class Transcriber {
         }
         checkIdle()
     }
+
+    /// A recording was renamed or moved (the library tells): its state and its job follow it.
+    func moved(_ old: URL, to new: URL) {
+        guard old != new else { return }
+        for (id, url) in places where url == old { places[id] = new }
+        if let state = states.removeValue(forKey: old) { states[new] = state }
+        if let wait = waiting.removeValue(forKey: old) { waiting[new] = wait }
+        if let token = preparing.removeValue(forKey: old) { preparing[new] = token }
+        if let poller = pollers.removeValue(forKey: old) { pollers[new] = poller }
+        for i in queue.indices where queue[i].source == old { queue[i] = queue[i].following(new) }
+        if let job = current?.job, job.source == old { current?.job = job.following(new) }
+        // The tracks of a recording's own job are found again at the next launch by its name (see `resumeInterrupted`).
+        for job in queue + [current?.job].compactMap({ $0 }) where job.source == new && !job.cleanup.lastPathComponent.hasPrefix("job-") {
+            try? new.path.write(to: job.cleanup.appending(path: Self.nameFile), atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// In a recording's tracks folder: the recording's path after a rename or a move (the folder keeps the first name).
+    private static let nameFile = "recording.txt"
 
     /// A recording just saved with its two tracks (automatic transcription, or an interrupted job found at launch).
     func enqueueRecording(m4a: URL, tracks: URL) {
@@ -133,36 +173,47 @@ final class Transcriber {
         states[source] = .queued
         let token = UUID()
         preparing[source] = token
-        let sidecar = Library.sidecarURL(for: source)
-        let split = FileManager.default.fileExists(atPath: sidecar.path)
+        places[token] = source
         // ponytail: a folder of its own per job (two folders can hold a "Meeting.m4a"), so a quit in the middle of a manual
         // transcript is not resumed; the sidecar stays, Transcribe again starts over.
         let folder = Tracks.folder(stamp: "job-\(token.uuidString)")
         Task {
             do {
                 var tracks: [(speaker: String, wav: URL)] = []
-                var output = source.deletingPathExtension().appendingPathExtension("md")
-                if split {
+                var kind = "md"
+                // Read at its place now: it may have been renamed since Transcribe was pressed, or while it was opened.
+                @MainActor func read<T: Sendable>(_ work: @escaping @Sendable (URL) throws -> T) async throws -> T {
+                    let first = places[token] ?? source
+                    do { return try await Task.detached { try work(first) }.value } catch {
+                        let now = places[token] ?? source
+                        guard now != first else { throw error }
+                        return try await Task.detached { try work(now) }.value
+                    }
+                }
+                if FileManager.default.fileExists(atPath: Library.sidecarURL(for: places[token] ?? source).path) {
                     do {
-                        try await Task.detached { try Tracks.splitSidecar(sidecar, into: folder) }.value
+                        try await read { try Tracks.splitSidecar(Library.sidecarURL(for: $0), into: folder) }
                         tracks = [("You", folder.appending(path: "me.wav")), ("Them", folder.appending(path: "them.wav"))]
                     } catch {
                         log("sidecar unreadable, using the mixed audio: \(error)")  // a damaged sidecar must not block the transcript
                     }
                 }
                 if tracks.isEmpty {
-                    let wav = try await Task.detached { try Tracks.convertFile(source, into: folder) }.value
+                    let wav = try await read { try Tracks.convertFile($0, into: folder) }
                     tracks = [("Speaker", wav)]
-                    output = source.deletingPathExtension().appendingPathExtension("transcript.md")
+                    kind = "transcript.md"
                 }
+                let source = places[token] ?? source  // renamed while its audio was read
                 guard states[source] == .queued, preparing[source] == token else {  // cancelled meanwhile (and maybe asked for again)
                     try? FileManager.default.removeItem(at: folder)  // this preparation's own folder
+                    places[token] = nil
                     return
                 }
                 preparing[source] = nil
-                enqueue(Job(source: source, title: source.deletingPathExtension().lastPathComponent, tracks: tracks, output: output, cleanup: folder))
+                enqueue(Job(id: token, source: source, title: source.deletingPathExtension().lastPathComponent, tracks: tracks, output: source.deletingPathExtension().appendingPathExtension(kind), cleanup: folder))
             } catch {
                 try? FileManager.default.removeItem(at: folder)
+                let source = places.removeValue(forKey: token) ?? source
                 guard preparing[source] == token else { return }
                 preparing[source] = nil
                 fail(source, "Could not read the audio: \(error.localizedDescription)")
@@ -181,9 +232,11 @@ final class Transcriber {
         let folders = (try? FileManager.default.contentsOfDirectory(at: Tracks.cache, includingPropertiesForKeys: nil)) ?? []
         for folder in folders {
             let stem = folder.lastPathComponent
-            // The recording may have been moved into a folder of the library since.
+            // Renamed or moved during the job: its path is written down; else it may have been moved into a folder of the library since.
+            let noted = (try? String(contentsOf: folder.appending(path: Self.nameFile), encoding: .utf8)).map { URL(fileURLWithPath: $0) }
             let places = [recordings] + Library.subfolders(of: recordings).map { recordings.appending(path: $0, directoryHint: .isDirectory) }
-            guard let m4a = places.map({ $0.appending(path: stem + ".m4a") }).first(where: { FileManager.default.fileExists(atPath: $0.path) }),
+            let candidates = noted.map { [$0] } ?? places.map { $0.appending(path: stem + ".m4a") }
+            guard let m4a = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }),
                   FileManager.default.fileExists(atPath: folder.appending(path: "me.wav").path),
                   FileManager.default.fileExists(atPath: folder.appending(path: "them.wav").path),
                   !FileManager.default.fileExists(atPath: m4a.deletingPathExtension().appendingPathExtension("md").path) else { continue }
@@ -255,6 +308,7 @@ final class Transcriber {
     private func enqueue(_ job: Job) {
         guard !shuttingDown else { return }
         states[job.source] = .queued
+        places[job.id] = job.source
         queue.append(job)
         guard !working else { return }
         working = true
@@ -274,11 +328,15 @@ final class Transcriber {
     private func run(_ job: Job) async {
         guard states[job.source] != nil else {  // cancelled while waiting
             try? FileManager.default.removeItem(at: job.cleanup)
+            places[job.id] = nil
             return
         }
         let process = WhisperProcess()
         current = (job, process)
-        defer { current = nil }
+        defer {
+            current = nil
+            places[job.id] = nil
+        }
         states[job.source] = .running(0)
         let language = language
         // The chosen model, or one that is on disk: Settings may have picked a model that is not downloaded yet.
@@ -287,30 +345,34 @@ final class Transcriber {
             guard models.state(model) == .installed else { throw RecorderError("The speech model is not downloaded.") }
             let results = try await Whisper.run(model: models.url(model), tracks: job.tracks.map(\.wav), language: language, handle: process) { [weak self] value in
                 Task { @MainActor in
-                    if case .running = self?.states[job.source] { self?.states[job.source] = .running(value) }
+                    guard let self else { return }
+                    let source = self.places[job.id] ?? job.source
+                    if case .running = self.states[source] { self.states[source] = .running(value) }
                 }
             }
-            let (lines, struck) = Transcript.merge(zip(job.tracks, results).map { ($0.speaker, $1) }, language: language)
-            let text = Transcript.render(lines, struck: struck, title: job.title, model: model.name, language: language, date: Date())
+            let now = job.following(places[job.id] ?? job.source)  // the recording may have been renamed or moved meanwhile
+            let (lines, struck) = Transcript.merge(zip(now.tracks, results).map { ($0.speaker, $1) }, language: language)
+            let text = Transcript.render(lines, struck: struck, title: now.title, model: model.name, language: language, date: Date())
             // The recording may have been moved or renamed meanwhile (for example by a second copy of the app);
             // a transcript at the old place would be hidden from it.
-            guard FileManager.default.fileExists(atPath: job.source.path) else {
+            guard FileManager.default.fileExists(atPath: now.source.path) else {
                 throw RecorderError("The recording was moved or renamed while it was transcribed. Transcribe it again.")
             }
-            let output = Self.unused(job.output)
+            let output = Self.unused(now.output)
             try text.write(to: output, atomically: true, encoding: .utf8)
-            try? FileManager.default.removeItem(at: job.cleanup)
-            states[job.source] = nil
-            if !job.source.path.hasPrefix(Library.defaultFolder.path + "/") { finishedElsewhere[job.source] = output }
+            try? FileManager.default.removeItem(at: now.cleanup)
+            states[now.source] = nil
+            if !now.source.path.hasPrefix(Library.defaultFolder.path + "/") { finishedElsewhere[now.source] = output }
             log("transcript: \(output.lastPathComponent), \(lines.count) paragraphs")
             AccessibilityNotification.Announcement("Transcript ready").post()
         } catch is CancellationError {
             // Quitting keeps the tracks of a recording for the next launch; a cancel, or a one-off file, leaves nothing behind.
             if !shuttingDown || job.cleanup.lastPathComponent.hasPrefix("job-") { try? FileManager.default.removeItem(at: job.cleanup) }
-            if case .running = states[job.source] { states[job.source] = nil }  // a new request made meanwhile keeps its state
+            let source = places[job.id] ?? job.source
+            if case .running = states[source] { states[source] = nil }  // a new request made meanwhile keeps its state
         } catch {
             try? FileManager.default.removeItem(at: job.cleanup)  // Try Again prepares the audio again
-            fail(job.source, error.localizedDescription)
+            fail(places[job.id] ?? job.source, error.localizedDescription)
         }
     }
 
