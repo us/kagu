@@ -219,6 +219,7 @@ final class Recorder {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         library = Library(folder: folder)
         transcriber.shouldPause = { [unowned self] in self.state != .idle || self.isRecovering }
+        library.onMove = { [transcriber] in transcriber.moved($0, to: $1) }
         transcriber.resumeInterrupted(recordings: folder)
         recoverLeftovers()
         // A file that changed in the last seconds is skipped above (it may still be written); look again once it settled.

@@ -18,6 +18,9 @@ enum Selftest {
         let chunks = [Turns.Chunk(packed: 0, start: 10, length: 2), Turns.Chunk(packed: 3.5, start: 20, length: 1)]
         let said = Turns.segments(words: [(0.5, "Hey,"), (1.9, "man."), (3.2, "How"), (2.6, "Thanks."), (4.0, "are")], chunks: chunks)
         expect(said == [Segment(start: 10, end: 12, text: "Hey, man."), Segment(start: 20, end: 21, text: "How are")], "words land in their stretch, one made up in the silence is dropped: \(said)")
+        let job = Transcriber.Job(source: URL(fileURLWithPath: "/r/Recording 1.m4a"), title: "Recording 1", tracks: [], output: URL(fileURLWithPath: "/r/Recording 1.transcript.md"), cleanup: URL(fileURLWithPath: "/t"))
+        let followed = job.following(URL(fileURLWithPath: "/r/x/Standup 2.m4a"))
+        expect(followed.output.path == "/r/x/Standup 2.transcript.md" && followed.title == "Standup 2", "a job follows its recording: \(followed.output.path)")
         let heard = Transcript.merge([("You", [Segment(start: 3, end: 4, text: "Yeah."), Segment(start: 12, end: 13, text: "Yeah.")]), ("Them", [Segment(start: 0, end: 10, text: "So we ship it on Friday.")])], language: "en")
         expect(heard.lines.map(\.text) == ["So we ship it on Friday.", "Yeah."] && heard.struck.fillers == 1, "a yeah said while they talk is listening, a yeah after is an answer: \(heard.lines.map(\.text))")
         let both = Transcript.merge([("You", [Segment(start: 0, end: 0.4, text: "Yeah.")]), ("Them", [Segment(start: 0, end: 0.6, text: "Okay.")])], language: "en")

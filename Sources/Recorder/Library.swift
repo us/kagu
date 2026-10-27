@@ -9,6 +9,7 @@ struct RecordingItem: Identifiable, Hashable, Sendable {
     let transcript: URL?
     let transcriptText: String
     let tags: [String]  // the Finder tags of the file
+    var colors: [String: Int] = [:]  // a tag's Finder color number, for the tags that have one
     var accession: String?  // "2026.43": its entry in the register, see `Register`
     var folder: String?  // the subfolder of the Recordings folder it lives in; nil for the top
     var preview = ""  // the first words of the transcript, read once in the scan (not on every redraw)
@@ -26,7 +27,7 @@ struct RecordingItem: Identifiable, Hashable, Sendable {
     func moved(to url: URL, folder: String?) -> RecordingItem {
         let stem = url.deletingPathExtension().lastPathComponent
         let transcript = transcript.map { url.deletingLastPathComponent().appending(path: stem + $0.lastPathComponent.dropFirst(self.stem.count)) }
-        return RecordingItem(url: url, date: date, duration: duration, transcript: transcript, transcriptText: transcriptText, tags: tags, accession: accession, folder: folder, preview: preview)
+        return RecordingItem(url: url, date: date, duration: duration, transcript: transcript, transcriptText: transcriptText, tags: tags, colors: colors, accession: accession, folder: folder, preview: preview)
     }
 }
 
@@ -38,6 +39,8 @@ final class Library {
     /// False until the folder has been read once, so an empty list is not mistaken for an empty library.
     private(set) var loaded = false
     var allTags: [String] { Set(items.flatMap(\.tags)).sorted() }
+    /// Each tag's color, from any recording that has it.
+    var tagColors: [String: Int] { items.reduce(into: [:]) { all, item in all.merge(item.colors) { first, _ in first } } }
     /// The subfolders of the Recordings folder, by name (a folder shows even while it is empty).
     private(set) var folders: [String] = []
     /// Every tag with the number of recordings that carry it, by name.
@@ -129,7 +132,7 @@ final class Library {
             // A default name holds the moment the recording started; the file date is when it was saved (later, for a recovered one).
             let started = DateFormatter.recordingStamp.date(from: String(stem.lastPathComponent.dropFirst("Recording ".count).prefix(19)))
             let preview = Transcript.parse(text).first.map { String($0.text.prefix(160)) } ?? (transcript != nil ? "No speech found" : "No transcript")
-            items.append(RecordingItem(url: url, date: stem.lastPathComponent.hasPrefix("Recording ") ? started ?? values?.creationDate ?? modified : values?.creationDate ?? modified, duration: duration, transcript: transcript, transcriptText: text, tags: values?.tagNames ?? [], accession: Register.read(url), folder: place.name, preview: preview))
+            items.append(RecordingItem(url: url, date: stem.lastPathComponent.hasPrefix("Recording ") ? started ?? values?.creationDate ?? modified : values?.creationDate ?? modified, duration: duration, transcript: transcript, transcriptText: text, tags: values?.tagNames ?? [], colors: tagColors(of: url), accession: Register.read(url), folder: place.name, preview: preview))
         }
         }
         return (items.sorted { $0.date > $1.date }, durations, subfolders)
@@ -223,9 +226,12 @@ final class Library {
         if let i = items.firstIndex(where: { $0.id == item.id }) {
             items[i] = item.moved(to: url, folder: directory.standardizedFileURL == folder.standardizedFileURL ? nil : directory.lastPathComponent)
         }
+        onMove?(item.url, url)
         return url
     }
 
+    /// Told about every rename and move, so a transcript in progress follows its recording.
+    @ObservationIgnored var onMove: ((_ old: URL, _ new: URL) -> Void)?
     /// Set when a failed move could not be put back completely; the view shows it once and clears it.
     var moveProblem: String?
     /// Recordings on their way to the Trash (it is asynchronous): a title edit left open must not rename them meanwhile.
@@ -337,8 +343,36 @@ final class Library {
         }
     }
 
+    /// Finder keeps a tag's color next to its name ("Red\n6") in this attribute; `tagNamesKey` gives only the names.
+    nonisolated static func tagColors(of url: URL) -> [String: Int] {
+        let name = "com.apple.metadata:_kMDItemUserTags"
+        let size = getxattr(url.path, name, nil, 0, 0, 0)
+        guard size > 0 else { return [:] }
+        var data = Data(count: size)
+        guard data.withUnsafeMutableBytes({ getxattr(url.path, name, $0.baseAddress, size, 0, 0) }) == size,
+              let entries = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String] else { return [:] }
+        let pairs = entries.compactMap { entry -> (String, Int)? in
+            let parts = entry.split(separator: "\n")
+            guard parts.count == 2, let number = Int(parts[1]), number > 0 else { return nil }
+            return (String(parts[0]), number)
+        }
+        return Dictionary(pairs) { first, _ in first }
+    }
+
+    /// The color tags as Finder names them in this language ("Red"); a tag of that name gets its color from the system.
+    static func colorTagName(_ number: Int) -> String? {
+        let labels = NSWorkspace.shared.fileLabels
+        return labels.indices.contains(number) ? labels[number] : nil
+    }
+
     /// Tags are Finder tags, so they show up in Finder and Spotlight too. Changing one does not touch the
     /// folder, so there is no file event: reload by hand.
+    /// Adds or removes one tag, on the tags the file has now: one set in Finder since the last scan stays.
+    func setTag(_ tag: String, _ on: Bool, for url: URL) {
+        let current = ((try? url.resourceValues(forKeys: [.tagNamesKey]))?.tagNames ?? []).filter { $0 != tag }
+        setTags(on ? current + [tag] : current, for: url)
+    }
+
     func setTags(_ tags: [String], for url: URL) {
         try? (url as NSURL).setResourceValue(tags, forKey: .tagNamesKey)
         reload()

@@ -3,11 +3,19 @@ import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// What a row's menu asks the recording's page to open: its title field or its tag editor.
+struct DetailRequest: Equatable {
+    enum Kind { case rename, tag }
+    let url: URL
+    let kind: Kind
+}
+
 /// One recording: an editable title with its actions, tags, the player, and the transcript or its details.
 struct DetailView: View {
     let item: RecordingItem
     let model: Recorder
     let player: Player
+    @Binding var request: DetailRequest?
     let onRename: (_ old: URL, _ new: URL) -> Void
 
     enum Tab { case transcript, details }
@@ -19,13 +27,15 @@ struct DetailView: View {
     @State private var query = ""
     @State private var confirmReplace = false
     @State private var editingTitle = false
+    @State private var addingTag = false
     @FocusState private var titleFocused: Bool
     @FocusState private var queryFocused: Bool
 
-    init(item: RecordingItem, model: Recorder, player: Player, onRename: @escaping (_ old: URL, _ new: URL) -> Void) {
+    init(item: RecordingItem, model: Recorder, player: Player, request: Binding<DetailRequest?>, onRename: @escaping (_ old: URL, _ new: URL) -> Void) {
         self.item = item
         self.model = model
         self.player = player
+        _request = request
         self.onRename = onRename
         _title = State(initialValue: item.displayTitle)
         blocks = Transcript.parse(item.transcriptText)  // once per update, not once per place that shows it
@@ -69,6 +79,14 @@ struct DetailView: View {
         } message: {
             Text("The current transcript goes to the Trash and a new one is made with the model chosen in Settings.")
         }
+        .onChange(of: request, initial: true) { _, request in
+            guard let request, request.url == item.url else { return }
+            self.request = nil
+            switch request.kind {
+            case .rename: editingTitle = true
+            case .tag: addingTag = true
+            }
+        }
         .task {
             player.load(item.url)
             peaks = await Waveform.peaks(url: item.url, count: 130)
@@ -91,7 +109,7 @@ struct DetailView: View {
                 actions.fixedSize()
             }
             Text(subtitle).font(.callout).foregroundStyle(.secondary).lineLimit(1)
-            TagBar(item: item, library: model.library)
+            TagBar(item: item, library: model.library, adding: $addingTag)
         }
     }
 
@@ -101,7 +119,7 @@ struct DetailView: View {
             // pencil sits right after it. A field left on screen kept a height it once measured wrong (15 pt for
             // the 28 pt title, the lower half of the title cut off), so the field is only there while editing.
             Text(title.isEmpty ? "Title" : title)
-                .font(Theme.title.weight(.bold))
+                .font(Theme.title)
                 .lineLimit(1)
                 .padding(.trailing, 10)  // the text field draws a few points wider than the text
                 .opacity(editingTitle ? 0 : 1)
@@ -114,7 +132,7 @@ struct DetailView: View {
                     if editingTitle {
                         TextField("Title", text: $title)
                             .textFieldStyle(.plain)
-                            .font(Theme.title.weight(.bold))
+                            .font(Theme.title)
                             .focused($titleFocused)
                             .onAppear { Task { @MainActor in titleFocused = true } }  // after the field is in the window, and after a menu closes
                             .onSubmit { titleFocused = false }
@@ -295,11 +313,6 @@ struct DetailView: View {
         // Unchanged, also when it only differs by what a file name drops ("Meeting ", "Meeting.m4a").
         guard title.trimmingCharacters(in: .whitespacesAndNewlines).normalizedSpaces != item.displayTitle.normalizedSpaces,
               Library.cleanName(title) != item.stem else { return title = item.displayTitle }
-        // Renaming moves the files a running transcript is about to write next to; wait until it is done.
-        guard transcriber.states[item.url].map(\.isFailure) ?? true else {
-            title = item.displayTitle
-            return model.show("Rename it once the transcript is finished.")
-        }
         guard let url = model.library.rename(item, to: title) else {
             let problem = model.library.moveProblem
             if problem != nil { model.library.moveProblem = nil }
@@ -514,21 +527,23 @@ private struct TranscribeControl: View {
 private struct TagBar: View {
     let item: RecordingItem
     let library: Library
+    @Binding var adding: Bool
 
-    @State private var adding = false
     @State private var draft = ""
 
     var body: some View {
         Flow(spacing: 6) {  // wraps: many tags in a narrow window stay whole
             ForEach(item.tags, id: \.self) { tag in
-                Text(tag)
-                    .font(.callout)
-                    .lineLimit(1)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 3)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Theme.card))
-                    .contextMenu { Button("Remove Tag") { library.setTags(item.tags.filter { $0 != tag }, for: item.url) } }
-                    .accessibilityAction(named: "Remove Tag") { library.setTags(item.tags.filter { $0 != tag }, for: item.url) }
+                HStack(spacing: 5) {
+                    if let color = Theme.tagColor(item.colors[tag]) { Circle().fill(color).frame(width: 8, height: 8) }
+                    Text(tag).lineLimit(1)
+                }
+                .font(.callout)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 3)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Theme.card))
+                .contextMenu { Button("Remove Tag") { library.setTag(tag, false, for: item.url) } }
+                .accessibilityAction(named: "Remove Tag") { library.setTag(tag, false, for: item.url) }
             }
             Button { adding = true } label: { Label("Add Tag", systemImage: "plus").font(.callout) }
                 .buttonStyle(.plain)
@@ -544,12 +559,12 @@ private struct TagBar: View {
         library.allTags.filter { !item.tags.contains($0) && (draft.isEmpty || $0.localizedCaseInsensitiveContains(draft)) }
     }
 
-    private var editor: some View { TagEditor(draft: $draft, suggestions: suggestions, add: add) }
+    private var editor: some View { TagEditor(draft: $draft, suggestions: suggestions, colors: library.tagColors, add: add) }
 
     private func add(_ name: String) {
         let tag = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !tag.isEmpty, !item.tags.contains(tag) else { return }
-        library.setTags(item.tags + [tag], for: item.url)
+        library.setTag(tag, true, for: item.url)
         draft = ""
         adding = false
     }
@@ -622,13 +637,22 @@ private struct Scrubber: View {
 private struct TagEditor: View {
     @Binding var draft: String
     let suggestions: [String]
+    let colors: [String: Int]
     let add: (String) -> Void
     @FocusState private var focused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             TextField("Tag", text: $draft).textFieldStyle(.roundedBorder).frame(width: 190).focused($focused).onSubmit { add(draft) }
-            ForEach(suggestions, id: \.self) { tag in Button(tag) { add(tag) }.buttonStyle(.plain).padding(.vertical, 2) }
+            ForEach(suggestions, id: \.self) { tag in
+                Button { add(tag) } label: {
+                    HStack(spacing: 5) {
+                        if let color = Theme.tagColor(colors[tag]) { Circle().fill(color).frame(width: 8, height: 8) }
+                        Text(tag)
+                    }
+                }
+                .buttonStyle(.plain).padding(.vertical, 2)
+            }
         }
         .padding(12)
         .onAppear { focused = true }
