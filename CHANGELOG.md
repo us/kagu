@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/us/kagu/compare/v0.2.4...v0.2.5) (2026-10-28)
+
+
+### Features
+
+* watch for calls with a small helper so Kagu can stay closed ([6b6501a](https://github.com/us/kagu/commit/6b6501a60f15a19075e85b4f41d31895ae7000f1))
+
 ## [0.2.4](https://github.com/us/kagu/compare/v0.2.3...v0.2.4) (2026-10-28)
 
 
