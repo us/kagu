@@ -3,9 +3,9 @@ import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// What a row's menu asks the recording's page to open: its title field or its tag editor.
+/// What a row's menu asks the recording's page to open: its title field or its tag editor; or ⌘F, its transcript search.
 struct DetailRequest: Equatable {
-    enum Kind { case rename, tag }
+    enum Kind { case rename, tag, find }
     let url: URL
     let kind: Kind
 }
@@ -16,6 +16,8 @@ struct DetailView: View {
     let model: Recorder
     let player: Player
     @Binding var request: DetailRequest?
+    /// True while ⌘F has a transcript search field to go to: the Transcript tab of a recording with a transcript.
+    @Binding var findsInTranscript: Bool
     let onRename: (_ old: URL, _ new: URL) -> Void
 
     enum Tab { case transcript, details }
@@ -28,18 +30,22 @@ struct DetailView: View {
     @State private var confirmReplace = false
     @State private var editingTitle = false
     @State private var addingTag = false
+    @State private var following = true  // the paragraph playing is kept in view until the user scrolls away
+    @State private var playing: Int?  // the paragraph playing, tinted (design-v2: a light accent tint, no dimming)
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var titleFocused: Bool
     @FocusState private var queryFocused: Bool
 
     /// The library search: its words are marked in the transcript, and the first line with them is scrolled to.
     let hint: String
 
-    init(item: RecordingItem, model: Recorder, player: Player, hint: String = "", request: Binding<DetailRequest?>, onRename: @escaping (_ old: URL, _ new: URL) -> Void) {
+    init(item: RecordingItem, model: Recorder, player: Player, hint: String = "", request: Binding<DetailRequest?>, findsInTranscript: Binding<Bool>, onRename: @escaping (_ old: URL, _ new: URL) -> Void) {
         self.item = item
         self.hint = hint.trimmingCharacters(in: .whitespaces)
         self.model = model
         self.player = player
         _request = request
+        _findsInTranscript = findsInTranscript
         self.onRename = onRename
         _title = State(initialValue: item.displayTitle)
         blocks = Transcript.parse(item.transcriptText)  // once per update, not once per place that shows it
@@ -50,7 +56,12 @@ struct DetailView: View {
     private var shownBlocks: [(offset: Int, element: Transcript.Block)] {
         let all = Array(blocks.enumerated())
         guard !query.isEmpty else { return all }
-        return all.filter { $0.element.text.localizedCaseInsensitiveContains(query) || $0.element.speaker.localizedCaseInsensitiveContains(query) }
+        return all.filter { Self.contains($0.element.text, query) }
+    }
+
+    /// Case and accents ignored, as the highlight: "gorusme" finds "görüşme".
+    private static func contains(_ text: String, _ term: String) -> Bool {
+        text.range(of: term, options: [.caseInsensitive, .diacriticInsensitive]) != nil
     }
 
     var body: some View {
@@ -59,6 +70,10 @@ struct DetailView: View {
                 header
                 PlayerBar(player: player, peaks: peaks)
                 tabs
+                if tab == .transcript, item.transcript != nil, transcriber.states[item.url] != nil {
+                    // Transcribed again: progress, Cancel or the failure stay in view; the old transcript stays until the new one is in.
+                    TranscribeControl(item: item, transcriber: transcriber)
+                }
             }
             .padding(.horizontal, 32)
             .padding(.top, 10)
@@ -81,7 +96,36 @@ struct DetailView: View {
                           let first = blocks.firstIndex(where: { $0.text.range(of: hint, options: [.caseInsensitive, .diacriticInsensitive]) != nil }) else { return }
                     proxy.scrollTo(first, anchor: .top)
                 }
+                // Clearing the search keeps the place: the first paragraph that matched stays in view.
+                .onChange(of: query) { old, new in
+                    guard new.isEmpty, !old.isEmpty, let first = blocks.firstIndex(where: { Self.contains($0.text, old) }) else { return }
+                    Task { @MainActor in proxy.scrollTo(first, anchor: .top) }  // after the full list is laid out again
+                }
+                // Following playback, as Podcasts transcripts: a scroll by the user stops it, Jump to Current resumes it.
+                .onScrollPhaseChange { _, phase in if phase == .interacting { following = false } }
+                .background { PlaybackFollower(player: player, blocks: blocks) { index in
+                    playing = index
+                    if let index, player.isPlaying, following, query.isEmpty { scroll(proxy, to: index) }
+                } }
+                .overlay(alignment: .bottom) {
+                    if tab == .transcript, query.isEmpty, player.isPlaying, !following {
+                        Button("Jump to Current") {
+                            following = true
+                            if let index = blocks.lastIndex(where: { $0.seconds <= player.time }) { scroll(proxy, to: index) }
+                        }
+                        .buttonStyle(QuietButtonStyle())
+                        .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
+                        .padding(.bottom, 14)
+                    }
+                }
             }
+        }
+        .onChange(of: player.isPlaying) { _, isPlaying in if isPlaying { following = true } }
+        .onChange(of: tab == .transcript && !blocks.isEmpty, initial: true) { _, searchable in findsInTranscript = searchable }
+        .task(id: query) {
+            try? await Task.sleep(for: .milliseconds(600))  // after typing settles
+            guard !Task.isCancelled, !query.isEmpty else { return }
+            AccessibilityNotification.Announcement(matchCount).post()
         }
         .focusable()
         .focusEffectDisabled()
@@ -89,7 +133,7 @@ struct DetailView: View {
             Button("Transcribe Again") { transcribeAgain() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The current transcript goes to the Trash and a new one is made with the model chosen in Settings.")
+            Text("A new transcript is made with the model chosen in Settings. The current one goes to the Trash once the new one is ready.")
         }
         .onChange(of: request, initial: true) { _, request in
             guard let request, request.url == item.url else { return }
@@ -97,6 +141,7 @@ struct DetailView: View {
             switch request.kind {
             case .rename: editingTitle = true
             case .tag: addingTag = true
+            case .find: queryFocused = true
             }
         }
         .task {
@@ -148,6 +193,7 @@ struct DetailView: View {
                             .focused($titleFocused)
                             .onAppear { Task { @MainActor in titleFocused = true } }  // after the field is in the window, and after a menu closes
                             .onSubmit { titleFocused = false }
+                            .onExitCommand { title = item.displayTitle; titleFocused = false }  // Esc keeps the old name, as in Finder
                             .accessibilityHint("Edit and press Return to rename")
                             .onChange(of: titleFocused) { _, focused in
                                 guard !focused else { return }
@@ -194,10 +240,7 @@ struct DetailView: View {
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
                 Button("Rename") { editingTitle = true }
                 Divider()
-                Button("Move to Trash") {
-                    transcriber.cancel(item.url)  // a job for a recording that is going away would only leave an orphan transcript
-                    model.library.trash(item)
-                }
+                Button("Move to Trash") { model.library.trash(item) }  // the list stops its transcript and moves the selection
             } label: {
                 Image(systemName: "ellipsis").frame(width: 14)
             }
@@ -232,7 +275,15 @@ struct DetailView: View {
             tabButton("Details", .details).fixedSize()
             Spacer(minLength: 12)
             if tab == .transcript && !blocks.isEmpty {
-                SearchField(prompt: "Search transcript...", text: $query, focus: $queryFocused).frame(minWidth: 140, maxWidth: 260)
+                HStack(spacing: 10) {
+                    if !query.isEmpty {
+                        ViewThatFits { Text(matchCount); Text("\(shownBlocks.count) of \(blocks.count)") }  // the short one in a narrow window
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel(matchCount)
+                    }
+                    SearchField(prompt: "Search transcript...", text: $query, focus: $queryFocused).frame(minWidth: 140, maxWidth: 260)
+                }
             }
         }
         .frame(height: 34)
@@ -258,12 +309,9 @@ struct DetailView: View {
     @ViewBuilder private var transcript: some View {
         if !blocks.isEmpty {
             LazyVStack(alignment: .leading, spacing: 18) {
-                ForEach(shownBlocks, id: \.offset) { _, block in
+                ForEach(shownBlocks, id: \.offset) { offset, block in
                     HStack(alignment: .firstTextBaseline, spacing: 0) {
-                        Button(duration(block.seconds)) {
-                            player.seek(to: block.seconds)
-                            if !player.isPlaying { player.toggle() }
-                        }
+                        Button(duration(block.seconds)) { play(from: block) }
                             .buttonStyle(.plain)
                             .font(.callout)
                             .foregroundStyle(.secondary)
@@ -279,9 +327,14 @@ struct DetailView: View {
                             .lineSpacing(4)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityAction(named: "Copy Paragraph") { copy(block) }
+                            .accessibilityAddTraits(offset == playing ? .isSelected : [])
+                            .contextMenu { paragraphMenu(block) }  // the selectable text would otherwise show only its own menu
                     }
+                    .background(RoundedRectangle(cornerRadius: 8).fill(offset == playing ? Theme.selection : .clear).padding(-8))
+                    .contextMenu { paragraphMenu(block) }
                 }
-                if shownBlocks.isEmpty { Text("No lines contain \u{201C}\(query)\u{201D}.").foregroundStyle(.secondary) }
+                if shownBlocks.isEmpty { Text("No paragraphs contain \u{201C}\(query)\u{201D}.").foregroundStyle(.secondary) }
                 if query.isEmpty { footnote }
             }
             .frame(maxWidth: 760, alignment: .leading)
@@ -309,6 +362,9 @@ struct DetailView: View {
         }
     }
 
+    /// "3 of 41 paragraphs": how many the transcript search leaves on view.
+    private var matchCount: String { "\(shownBlocks.count) of \(blocks.count) \(blocks.count == 1 ? "paragraph" : "paragraphs")" }
+
     /// The search words get a soft red mark.
     private func highlighted(_ text: String) -> AttributedString {
         var result = AttributedString(text)
@@ -320,6 +376,11 @@ struct DetailView: View {
             searchFrom = range.upperBound
         }
         return result
+    }
+
+    @ViewBuilder private func paragraphMenu(_ block: Transcript.Block) -> some View {
+        Button("Copy Paragraph") { copy(block) }
+        Button("Play from Here") { play(from: block) }
     }
 
     // MARK: Actions
@@ -339,6 +400,24 @@ struct DetailView: View {
         onRename(item.url, url)
     }
 
+    private func play(from block: Transcript.Block) {
+        player.seek(to: block.seconds)
+        following = true
+        if !player.isPlaying { player.toggle() }
+    }
+
+    /// The paragraph playing near the top, with a little of the one before it above; no animation with Reduce Motion.
+    private func scroll(_ proxy: ScrollViewProxy, to index: Int) {
+        let anchor = UnitPoint(x: 0, y: 0.2)
+        if reduceMotion { proxy.scrollTo(index, anchor: anchor) } else { withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(index, anchor: anchor) } }
+    }
+
+    /// "Them 12:40: ..."
+    private func copy(_ block: Transcript.Block) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("\(block.speaker) \(duration(block.seconds)): \(block.text)", forType: .string)
+    }
+
     private func copy() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(Transcript.plainText(title: item.displayTitle, date: item.date, blocks: blocks), forType: .string)
@@ -349,16 +428,10 @@ struct DetailView: View {
         }
     }
 
-    /// The old transcript goes to the Trash (recoverable), then the normal Transcribe path makes a new one.
+    /// A new transcript is made; the old one stays on screen and goes to the Trash (recoverable) once the new one is written.
     private func transcribeAgain() {
-        guard let old = item.transcript else { return }
-        do {
-            try FileManager.default.trashItem(at: old, resultingItemURL: nil)
-        } catch {
-            return model.show("Could not move the old transcript to the Trash: \(error.localizedDescription)")
-        }
-        transcriber.request(item.url)
-        model.library.reload()
+        guard item.transcript != nil else { return }
+        transcriber.request(item.url, again: true)
     }
 
     enum Export { case transcriptMarkdown, transcriptText, audio }
@@ -516,7 +589,7 @@ private struct TranscribeControl: View {
                 Text(transcriber.models.state(transcriber.model) == .installed
                      ? "No transcript yet. Transcribe makes a text version on this Mac."
                      : "No transcript yet. The first time, a speech model (\(transcriber.model.sizeText)) is downloaded once.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.callout)
             case .queued:
                 progress(nil, transcriber.shouldPause() ? "Waiting for the recording to finish"
                          : transcriber.isBusyElsewhere(item.url) ? "Waiting for another transcript to finish" : "Preparing")
@@ -525,8 +598,11 @@ private struct TranscribeControl: View {
             case .running(let value):
                 progress(value > 0 ? value : nil, value > 0 ? "Transcribing \(Int(value * 100))%" : "Transcribing")
             case .failed(let text):
-                Label(text, systemImage: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).foregroundStyle(.secondary)
-                Button("Try Again") { transcriber.request(item.url) }
+                Label(text, systemImage: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
+                HStack {
+                    Button("Try Again") { transcriber.request(item.url) }
+                    if item.transcript != nil { Button("Keep Current") { transcriber.cancel(item.url) } }  // a failed Transcribe Again
+                }
             }
         }
     }
@@ -534,7 +610,7 @@ private struct TranscribeControl: View {
     private func progress(_ value: Double?, _ label: String) -> some View {
         HStack(spacing: 12) {
             if let value { ProgressView(value: value).frame(width: 220).tint(Theme.accent) } else { ProgressView().controlSize(.small) }
-            Text(label).foregroundStyle(.secondary)
+            Text(label)
             Button("Cancel") { transcriber.cancel(item.url) }.buttonStyle(.borderless)
         }
     }
@@ -587,13 +663,32 @@ private struct TagBar: View {
     }
 }
 
-/// The player card: a round play button, the time, the waveform with a red playhead, the length.
+/// Reads the playhead ten times a second in a view of its own, so the transcript is not drawn again each time,
+/// and says when the paragraph playing changes.
+private struct PlaybackFollower: View {
+    let player: Player
+    let blocks: [Transcript.Block]
+    let follow: (Int?) -> Void
+
+    var body: some View {
+        // Once played: before that no paragraph is the current one.
+        Color.clear.onChange(of: player.isPlaying || player.time > 0 ? blocks.lastIndex(where: { $0.seconds <= player.time }) : nil) { _, index in
+            follow(index)
+        }
+    }
+}
+
+/// The player card: a round play button, the time, the waveform with a red playhead, the length, the speed.
 private struct PlayerBar: View {
     let player: Player
     let peaks: [Float]
 
     var body: some View {
         HStack(spacing: 12) {
+            if player.failed {
+                Label("This audio cannot be played.", systemImage: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.callout)
+                Spacer()
+            } else {
             Button { player.toggle() } label: {
                 Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
                     .font(.system(size: 13, weight: .semibold))
@@ -614,6 +709,23 @@ private struct PlayerBar: View {
                         .accessibilityValue("\(spoken(player.time)) of \(spoken(player.duration))")
                 }
             Text(duration(player.duration)).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+            Menu {
+                Picker("Speed", selection: Binding(get: { player.rate }, set: { player.rate = $0 })) {
+                    ForEach(Player.rates, id: \.self) { Text(Player.name($0)).tag($0) }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            } label: {
+                Text(Player.name(player.rate)).monospacedDigit().frame(minWidth: 34)  // the same width for 1× and 1.25×
+            }
+            .menuStyle(.button)
+            .buttonStyle(QuietButtonStyle())
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Playback speed")
+            .accessibilityLabel("Playback speed")
+            .accessibilityValue("\(player.rate.formatted()) times")
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)

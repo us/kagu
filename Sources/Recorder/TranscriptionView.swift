@@ -186,6 +186,8 @@ private struct ModelRow: View {
         .background(selected ? Theme.raised : Color.clear)  // the chosen model is the white row, as in the mockup
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
+        .focusable()  // the keyboard picks a model too: Tab to it, Space or Return
+        .onKeyPress(keys: [.space, .return]) { _ in select(); return .handled }
         .help(selected ? "The model used for new transcripts" : "Use this model")
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? [.isSelected, .isButton] : .isButton)
@@ -197,7 +199,7 @@ private struct ModelRow: View {
         case .missing: Text("Not downloaded")
         case .downloading(let value): HStack(spacing: 6) { ProgressView(value: value).frame(width: 120).tint(Theme.accent); Text("\(Int(value * 100))%") }
         case .verifying: Text("Checking the download")
-        case .installed: Text("Downloaded")
+        case .installed: Text(selected ? "Downloaded, in use" : "Downloaded")
         }
     }
 }
@@ -246,14 +248,16 @@ private struct GeneralSettings: View {
                 Text("Zoom, Teams, Slack, Discord, FaceTime, WhatsApp, Webex, and Google Meet in Chrome. When the call ends, Kagu asks to stop and saves after 2 minutes.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if askToRecordCalls, notificationsOff {
-                    Text("Notifications are off for Kagu, so it cannot ask.").font(.caption).foregroundStyle(.orange)
+                    Label { Text("Notifications are off for Kagu, so it cannot ask.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                        .font(.caption).foregroundStyle(.secondary)
                     Button("Open Notification Settings") {
                         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=local.recorder")!)
                     }
                     .controlSize(.small)
                 }
                 if askToRecordCalls, chromeTabsDenied {
-                    Text("Kagu is not allowed to see Chrome tabs, so it cannot notice Google Meet.").font(.caption).foregroundStyle(.orange)
+                    Label { Text("Kagu is not allowed to see Chrome tabs, so it cannot notice Google Meet.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                        .font(.caption).foregroundStyle(.secondary)
                     Button("Open Automation Settings") { open("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") }
                         .controlSize(.small)
                 }
@@ -273,7 +277,8 @@ private struct GeneralSettings: View {
                 shortcut("Pause or resume", "⇧⌘P")
                 shortcut("Play or pause", "Space")
                 shortcut("Back or forward 15 seconds", "← →")
-                shortcut("Search", "⌘F")
+                shortcut("Find in transcript", "⌘F")
+                shortcut("Search recordings", "⌥⌘F")
                 shortcut("Import audio files", "⇧⌘I")
                 shortcut("Transcribe an audio file", "⇧⌘T")
             }
@@ -336,8 +341,9 @@ private struct PrivacySettings: View {
 
     var body: some View {
         SettingRow(label: "Microphone") {
-            Label(micText, systemImage: mic == .authorized ? "checkmark.circle.fill" : "exclamationmark.circle")
-                .foregroundStyle(mic == .authorized ? Color.green : .orange)
+            Label { Text(micText) } icon: {  // the color on the icon only: green or orange text on the canvas is too faint
+                Image(systemName: mic == .authorized ? "checkmark.circle.fill" : "exclamationmark.circle").foregroundStyle(mic == .authorized ? Color.green : .orange)
+            }
         }
         SettingRow(label: "System audio") {
             Text("Asked on the first recording; changed in Screen & System Audio Recording").foregroundStyle(.secondary)

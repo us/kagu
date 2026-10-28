@@ -35,6 +35,7 @@ struct RecorderApp: App {
                 }
                 Button("Check for Updates...") { Updater.shared?.check() }
             }
+            RecordingMenu()
             CommandMenu("Playback") {
                 Button("Play or Pause") { delegate.model.player.toggle() }.keyboardShortcut(.space, modifiers: .option)
                     .disabled(!delegate.model.player.isLoaded)
@@ -43,6 +44,10 @@ struct RecorderApp: App {
                     .disabled(!delegate.model.player.isLoaded)
                 Button("Skip Forward 15 Seconds") { delegate.model.player.skip(15) }
                     .disabled(!delegate.model.player.isLoaded)
+                Divider()
+                Picker("Speed", selection: Binding(get: { delegate.model.player.rate }, set: { delegate.model.player.rate = $0 })) {
+                    ForEach(Player.rates, id: \.self) { Text(Player.name($0)).tag($0) }
+                }
             }
         }
         Window("Transcribe Audio File", id: "import") {
@@ -208,6 +213,10 @@ final class Recorder {
     private(set) var isPaused = false
     /// Seconds actually in the file (paused time not counted), from the frames the capture wrote.
     private(set) var elapsed: Double = 0
+    /// `elapsed` in whole seconds, changed once a second: the menu bar shows it without redrawing 15 times a second.
+    private(set) var wholeSeconds = 0
+    /// The call app this recording runs during (CallWatcher sets it); the saved take gets it as a Finder tag.
+    var callApp: String?
     /// The last levels (newest last), for the recording window's moving waveform.
     private(set) var levelHistory: [Float] = []
     /// Opens the library window from anywhere (set by a view that has `openWindow`).
@@ -220,8 +229,14 @@ final class Recorder {
     private(set) var message: String?
     /// The log line of the error in `message`, shown under it as its condition report.
     private(set) var report: Int?
-    /// A System Settings pane the notice can open (the mic permission).
+    /// A System Settings pane the notice can open (a permission), or a folder it can show in Finder.
     private(set) var messageLink: URL?
+    /// The notice is good news (recovered, imported): a check mark instead of the warning sign.
+    private(set) var messageIsNews = false
+    /// The notice is work in progress (an import): a spinner instead of an icon.
+    private(set) var messageIsBusy = false
+    /// The System Settings pane that fixes the current `warning`, when one does.
+    private(set) var warningLink: URL?
     /// While saving: when it began and how long it should take, from this Mac's earlier saves.
     private(set) var savingSince: Date?
     private(set) var savingEstimate: Double?
@@ -333,6 +348,8 @@ final class Recorder {
             started = Date()
             isPaused = false
             elapsed = 0
+            wholeSeconds = 0
+            callApp = nil
             levelHistory = []
             lastFrames = 0
             stalledTicks = 0
@@ -350,7 +367,8 @@ final class Recorder {
             RunLoop.main.add(timer, forMode: .common)  // keeps fault checks running while a menu is open
             meterTimer = timer
         } catch {
-            fail(error.localizedDescription)
+            let text = error.localizedDescription
+            fail(text, link: text.contains("Screen & System Audio Recording") ? Self.screenSettings : nil)
         }
     }
 
@@ -369,10 +387,11 @@ final class Recorder {
         systemLevel = 0
         if let reason {
             log("stopped: \(reason)")
-            notify(reason, expires: false)
+            notify(reason, expires: false, important: true)
             CallWatcher.alert("Recording stopped", reason)  // a stop nobody asked for, maybe behind a full-screen call
         }
         let keepRaw = keepRaw
+        let tag = callApp
         let m4a = Convert.finalURL(for: capture.url)
         let tracksFolder = Tracks.folder(stamp: m4a.deletingPathExtension().lastPathComponent)
         AccessibilityNotification.Announcement("Recording stopped").post()
@@ -389,7 +408,10 @@ final class Recorder {
                 if error == nil, let since = self.savingSince { SaveRate.record(saving: Date().timeIntervalSince(since), audio: seconds) }
                 self.savingSince = nil
                 self.savingEstimate = nil
-                if let error { self.fail("Could not finish saving: \(error.localizedDescription) The audio is kept: free up disk space, then switch back to Kagu to save it.") } else if empty { self.fail("Nothing was recorded: the audio stream did not start.") } else { self.lastFile = m4a }
+                if let error { self.fail("Could not finish saving: \(error.localizedDescription) The audio is kept: free up disk space, then switch back to Kagu to save it.") } else if empty { self.fail("Nothing was recorded: the audio stream did not start.") } else {
+                    if let tag { self.library.setTags([tag], for: m4a) }  // "Google Meet", "Discord": findable and filterable later
+                    self.lastFile = m4a
+                }
                 self.finishTracks(m4a: m4a, tracks: tracks)
                 self.becomeIdle()
             }
@@ -407,6 +429,8 @@ final class Recorder {
         message = nil
         report = nil
         messageLink = nil
+        messageIsNews = false
+        messageIsBusy = false
     }
 
     /// Pause keeps the mic open but writes nothing; Resume carries on in the same file.
@@ -432,6 +456,9 @@ final class Recorder {
         Task {
             var imported: [URL] = []
             var failed: [String] = []
+            if urls.count > 1 || urls.contains(where: { ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 20_000_000 }) {
+                notify(urls.count == 1 ? "Importing \(urls[0].lastPathComponent)..." : "Importing \(urls.count) files...", expires: false, busy: true)
+            }
             // A file already in the library (dragged in from Finder) stays one recording.
             for url in urls where !url.standardizedFileURL.path.hasPrefix(folder.standardizedFileURL.path + "/") {
                 do { imported.append(try await Library.importAudio(url, into: directory)) } catch {
@@ -440,10 +467,13 @@ final class Recorder {
                 }
             }
             if let first = imported.first { lastFile = first }  // the list shows and selects it
+            let done = imported.count == 1 ? "Imported 1 recording." : "Imported \(imported.count) recordings."
             if !failed.isEmpty {
-                fail("Could not import \(failed.formatted(.list(type: .and))). Kagu reads m4a, mp3, wav, aiff and caf audio.")
+                fail((imported.isEmpty ? "" : done + " ") + "Could not import \(failed.formatted(.list(type: .and))). Kagu reads m4a, mp3, wav, aiff and caf audio.")
             } else if imported.count > 1 {
-                notify("Imported \(imported.count) recordings.")
+                notify(done, news: true)
+            } else if message?.hasPrefix("Importing") == true {
+                dismissMessage()
             }
         }
     }
@@ -452,6 +482,9 @@ final class Recorder {
 
     /// A short notice from a view (a failed export, a transcript that could not be replaced).
     func show(_ text: String) { fail(text) }
+
+    /// A short note that goes away by itself (a name that is taken, an update that waits): not an error to file.
+    func tell(_ text: String, lasting: Bool = false) { notify(text, expires: !lasting) }
 
     /// Runs `action` once nothing is recording or saving.
     func whenIdle(_ action: @escaping () -> Void) {
@@ -468,6 +501,7 @@ final class Recorder {
         micLevel = max(peaks.mic, micLevel * 0.85)
         systemLevel = max(peaks.system, systemLevel * 0.85)
         elapsed = Double(capture.framesKept.load(ordering: .relaxed)) / capture.sampleRate
+        if elapsed.isFinite, Int(elapsed) != wholeSeconds { wholeSeconds = Int(elapsed) }
         if !isPaused, ticks % 3 == 0 {  // 5 values a second
             levelHistory.append(max(micLevel, systemLevel))
             if levelHistory.count > 120 { levelHistory.removeFirst(levelHistory.count - 120) }
@@ -500,6 +534,7 @@ final class Recorder {
         let deaf = !isPaused && systemPeakEver == 0 && outputTicks >= 900
         let text = lowDisk ?? (silent ? "No sound from the mic. Another app may be using it, or Kagu has no mic access."
             : deaf ? "No sound from the Mac yet. If you hear the call, allow Kagu in System Settings, Privacy & Security, Screen & System Audio Recording." : nil)
+        warningLink = lowDisk == nil && !silent && deaf ? Self.screenSettings : nil
         if let text, text != warning {
             AccessibilityNotification.Announcement(text).post()
             log("warning: \(text)")
@@ -532,11 +567,12 @@ final class Recorder {
 
     static let micDenied = "Kagu needs the microphone. Allow it in System Settings, Privacy & Security, Microphone."
     static let micSettings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+    static let screenSettings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
 
     /// The notice is in the library window, so the window comes up when it is closed (a recording started from the menu bar).
     /// An error stays until it is dismissed: it may be read only after a call.
     private func fail(_ text: String, link: URL? = nil) {
-        notify(text, expires: false)
+        notify(text, expires: false, important: true)
         report = log("error: \(text)")
         messageLink = link
         openMainWindow?()
@@ -544,10 +580,14 @@ final class Recorder {
     }
 
     /// A short line at the top of the list; a confirmation goes away by itself.
-    private func notify(_ text: String, expires: Bool = true) {
+    /// `important`: an error or an unplanned stop; anything else never replaces one that is on screen (it has a report).
+    private func notify(_ text: String, expires: Bool = true, news: Bool = false, busy: Bool = false, important: Bool = false) {
+        guard important || report == nil else { _ = log("note held back behind an error: \(text)"); return }
+        messageIsBusy = busy
         message = text
         report = nil
         messageLink = nil
+        messageIsNews = news
         AccessibilityNotification.Announcement(text).post()
         guard expires, !text.contains("/") else { return }  // a line that names a file stays until it is dismissed
         Task {
@@ -597,9 +637,12 @@ final class Recorder {
                 for item in transcripts { self.finishTracks(m4a: item.m4a, tracks: item.tracks) }
                 if let recovered {
                     self.lastFile = recovered
-                    self.notify("Recovered an unfinished recording.")
+                    self.notify("Recovered an unfinished recording.", news: true)
                 }
-                if let failed { self.fail("Could not recover an unfinished recording; it is kept at \(failed.path).") }
+                if let failed {
+                    self.fail("Could not recover an unfinished recording. Its audio is kept in the Recordings folder as the hidden file \(failed.lastPathComponent); in Finder, Shift-Command-Period shows hidden files.",
+                              link: failed.deletingLastPathComponent())
+                }
                 self.isRecovering = false
                 self.runIdleWaiters()
             }

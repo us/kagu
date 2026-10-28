@@ -98,7 +98,7 @@ final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
             ended()
         }
         if let call {
-            if model.state == .recording { recordingInCall = model.started; asked = true }
+            if model.state == .recording { recordingInCall = model.started; asked = true; model.callApp = call }
             if model.state == .idle, !asked {
                 asked = true
                 post(Self.startID, title: "Call in \(call)", body: "Record it with Kagu?")

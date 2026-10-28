@@ -17,6 +17,11 @@ struct MenuBarMenu: View {
             .disabled(model.state != .recording)
         Divider()
         Button { show("main") } label: { Label("Show App", systemImage: "macwindow") }
+        Button {
+            NSApp.activate()
+            model.chooseAudio()
+            show("main")  // where the imported recording and any notice are
+        } label: { Label("Import Audio...", systemImage: "square.and.arrow.down") }
         Button { show("import") } label: { Label("Transcribe Audio File...", systemImage: "waveform") }
         Divider()
         Button {
@@ -37,7 +42,8 @@ struct MenuBarMenu: View {
 
     /// "On the record 00:41:12." while recording, else what the register holds: "On file: 43 entries, 61 h 24 min. 1 withdrawn."
     private var footer: String {
-        if model.state == .recording { return "On the record \(Transcript.clock(model.elapsed))." }
+        if model.state == .recording { return "On the record \(duration(Double(model.wholeSeconds)))." }
+        if model.state == .saving { return "Saving the recording." }
         let items = model.library.items
         let minutes = Int(items.reduce(0) { $0 + $1.duration } / 60)
         let hours = "\(minutes / 60) h \(minutes % 60) min"
@@ -66,9 +72,16 @@ struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(systemName: model.state != .recording ? "record.circle" : model.isPaused ? "pause.circle.fill" : "record.circle.fill")
-            .accessibilityLabel(model.state != .recording ? "Kagu" : model.isPaused ? "Kagu, paused" : "Kagu, recording")
-            .onAppear { model.openMainWindow = { [openWindow] in openWindow(id: "main") } }
+        // While recording, the time runs next to the icon: a recording that stopped shows even with a call in full screen.
+        HStack(spacing: 4) {
+            Image(systemName: model.state == .saving ? "arrow.down.circle" : model.state != .recording ? "record.circle" : model.isPaused ? "pause.circle.fill" : "record.circle.fill")
+            if model.state == .recording { Text(duration(Double(model.wholeSeconds))).monospacedDigit() }
+            if model.state == .saving { Text("Saving") }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(model.state == .saving ? "Kagu, saving" : model.state != .recording ? "Kagu" : model.isPaused ? "Kagu, paused" : "Kagu, recording")
+        .accessibilityValue(model.state == .recording ? spoken(Double(model.wholeSeconds)) : "")
+        .onAppear { model.openMainWindow = { [openWindow] in openWindow(id: "main") } }
     }
 }
 
@@ -125,7 +138,7 @@ struct ImportView: View {
             Text(url.lastPathComponent).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
             if let output = transcriber.finishedElsewhere[url] {
                 HStack {
-                    Label("Transcript saved", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.callout)
+                    Label { Text("Transcript saved") } icon: { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }.font(.callout)
                     Spacer()
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([output]) }.controlSize(.small)
                 }
@@ -137,7 +150,7 @@ struct ImportView: View {
                     Label(text, systemImage: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.caption).foregroundStyle(.secondary)
                     Button("Try Again") { transcriber.request(url) }.controlSize(.small)
                 case .queued, .downloadingModel:
-                    HStack { ProgressView().controlSize(.small); Text(transcriber.states[url] == .downloadingModel ? "Downloading the speech model" : "Preparing").font(.caption).foregroundStyle(.secondary) }
+                    HStack { ProgressView().controlSize(.small); Text(transcriber.states[url] == .downloadingModel ? "Downloading the speech model" : transcriber.isBusyElsewhere(url) ? "Waiting for another transcript to finish" : "Preparing").font(.caption).foregroundStyle(.secondary) }
                 case nil:
                     if Self.hasTranscript(url) {
                         Text("A transcript for this file already exists next to it.").font(.caption).foregroundStyle(.secondary)
