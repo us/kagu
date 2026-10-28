@@ -497,7 +497,7 @@ private struct DetailsTable: View {
         if let file = try? AVAudioFile(forReading: item.url) {
             let f = file.fileFormat
             let codec = f.settings[AVFormatIDKey] as? UInt32 == kAudioFormatMPEG4AAC ? "AAC" : "PCM"
-            format = "\(codec), \(Int(f.sampleRate / 1000)) kHz, \(f.channelCount == 2 ? "stereo" : "\(f.channelCount) channels")"
+            format = "\(codec), \(Int(f.sampleRate / 1000)) kHz, \(f.channelCount == 1 ? "mono" : f.channelCount == 2 ? "stereo" : "\(f.channelCount) channels")"
         }
         // The second line of a transcript names the model, for example "Large v3 turbo, ... transcribed Oct 21".
         model = item.transcriptText.split(separator: "\n", omittingEmptySubsequences: true).dropFirst().first.map(String.init) ?? ""

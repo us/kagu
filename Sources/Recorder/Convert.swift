@@ -9,8 +9,8 @@ private func softClip(_ x: Float) -> Float {
 }
 
 enum Convert {
-    /// Mixes the 3 channel CAF (mic, system L, system R) into a stereo AAC m4a: the mic, with the
-    /// speaker echo removed, goes to both channels, and one gain for the whole file keeps the loudest
+    /// Mixes the 3 channel CAF (mic, system L, system R) into a mono AAC m4a, the format Whisper reads: the mic,
+    /// with the speaker echo removed, over the system audio, and one gain for the whole file keeps the loudest
     /// moment under full scale. The m4a is written under a temporary name and moved into place only
     /// when it reads back with the full length; then the CAF is deleted. The same pass also writes the
     /// cleaned mic and the system audio as two 16 kHz mono WAVs into `tracksFolder` (returned; it is
@@ -90,7 +90,7 @@ enum Convert {
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: rate,
-            AVNumberOfChannelsKey: 2,
+            AVNumberOfChannelsKey: 1,
             AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
         ]
         let output = try AVAudioFile(forWriting: partial, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
@@ -102,7 +102,7 @@ enum Convert {
             }
         }
         let sink = try TrackSink(folder: tracksFolder, sampleRate: rate)
-        let outBuffer = AVAudioPCMBuffer(pcmFormat: AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2)!, frameCapacity: AVAudioFrameCount(chunk))!
+        let outBuffer = AVAudioPCMBuffer(pcmFormat: AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1)!, frameCapacity: AVAudioFrameCount(chunk))!
         // Test aid behind --keep-raw: the cleaned mic alone, so the canceller can be scored exactly.
         let cleanMic = keepRaw ? try AVAudioFile(forWriting: m4a.deletingPathExtension().appendingPathExtension("mic-clean.caf"), settings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: rate, AVNumberOfChannelsKey: 1,
@@ -114,8 +114,7 @@ enum Convert {
             let o = outBuffer.floatChannelData!
             for i in 0..<n {
                 boosted[i] = softClip(m[i] * micGain)
-                o[0][i] = softClip((l[i] + m[i] * micGain) * gain)
-                o[1][i] = softClip((r[i] + m[i] * micGain) * gain)
+                o[0][i] = softClip(((l[i] + r[i]) / 2 + m[i] * micGain) * gain)  // never louder than the left or right sum the peak was taken from
             }
             outBuffer.frameLength = AVAudioFrameCount(n)
             try output.write(from: outBuffer)
