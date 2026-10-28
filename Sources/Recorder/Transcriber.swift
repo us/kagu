@@ -49,6 +49,8 @@ final class Transcriber {
     var language: String { didSet { UserDefaults.standard.set(language, forKey: "whisperLanguage") } }
 
     private var queue: [Job] = []
+    /// Recordings whose transcript is made again: the old one stays until the new one is written.
+    private var replacing: Set<URL> = []
     private var current: (job: Job, process: WhisperProcess)?
     private var working = false
     private var shuttingDown = false
@@ -83,11 +85,13 @@ final class Transcriber {
     // MARK: - Asking for a transcript
 
     /// The Transcribe button: downloads the model first when it is missing, then prepares the audio and queues the job.
-    func request(_ source: URL) {
+    /// `again`: Transcribe Again; the transcript there now goes to the Trash only once the new one is made.
+    func request(_ source: URL, again: Bool = false) {
         guard !shuttingDown, states[source].map(\.isFailure) ?? true else { return }
         // Already transcribed: the result is next to the recording, a second one would only be a hidden copy.
         let stem = source.deletingPathExtension()
-        if [stem.appendingPathExtension("md"), stem.appendingPathExtension("transcript.md")].contains(where: { FileManager.default.fileExists(atPath: $0.path) }) { return }
+        if again { replacing.insert(source) }  // kept after a failure, so Try Again goes on replacing
+        if !replacing.contains(source), [stem.appendingPathExtension("md"), stem.appendingPathExtension("transcript.md")].contains(where: { FileManager.default.fileExists(atPath: $0.path) }) { return }
         finishedElsewhere[source] = nil
         if models.state(model) == .installed {
             prepare(source)
@@ -119,6 +123,7 @@ final class Transcriber {
 
     /// Stops a transcript in progress for one recording.
     func cancel(_ source: URL) {
+        replacing.remove(source)
         let wait = waiting.removeValue(forKey: source)
         states[source] = nil
         preparing[source] = nil
@@ -146,6 +151,7 @@ final class Transcriber {
         if let wait = waiting.removeValue(forKey: old) { waiting[new] = wait }
         if let token = preparing.removeValue(forKey: old) { preparing[new] = token }
         if let poller = pollers.removeValue(forKey: old) { pollers[new] = poller }
+        if replacing.remove(old) != nil { replacing.insert(new) }
         for i in queue.indices where queue[i].source == old { queue[i] = queue[i].following(new) }
         if let job = current?.job, job.source == old { current?.job = job.following(new) }
         // The tracks of a recording's own job are found again at the next launch by its name (see `resumeInterrupted`).
@@ -361,6 +367,14 @@ final class Transcriber {
             // a transcript at the old place would be hidden from it.
             guard FileManager.default.fileExists(atPath: now.source.path) else {
                 throw RecorderError("The recording was moved or renamed while it was transcribed. Transcribe it again.")
+            }
+            if replacing.remove(job.source) != nil || replacing.remove(now.source) != nil {
+                let stem = now.source.deletingPathExtension()
+                for old in [stem.appendingPathExtension("md"), stem.appendingPathExtension("transcript.md")] where FileManager.default.fileExists(atPath: old.path) {
+                    do { try FileManager.default.trashItem(at: old, resultingItemURL: nil) } catch {  // recoverable, and only now that the new one is here
+                        log("transcript again: could not move \(old.lastPathComponent) to the Trash: \(error)")  // the new one then gets " 2"
+                    }
+                }
             }
             let output = Self.unused(now.output)
             try text.write(to: output, atomically: true, encoding: .utf8)

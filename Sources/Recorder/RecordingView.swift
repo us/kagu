@@ -8,7 +8,10 @@ final class RecordingWindow {
 
     func show(model: Recorder) {
         if window == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 300), styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView], backing: .buffered, defer: false)
+            // A panel that does not take the focus: Pause or Stop leave the call app in front, and it can show over a call in full screen.
+            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 300), styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
+            window.hidesOnDeactivate = false
+            window.becomesKeyOnlyIfNeeded = true
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             window.title = "Recording"
@@ -16,7 +19,10 @@ final class RecordingWindow {
             window.isReleasedWhenClosed = false
             window.appearance = NSAppearance(named: .darkAqua)
             window.backgroundColor = NSColor(srgbRed: 0.11, green: 0.11, blue: 0.11, alpha: 1)
-            window.contentView = NSHostingView(rootView: RecordingView(model: model))
+            window.contentView = FirstClickHostingView(rootView: RecordingView(model: model))
+            // Over other apps and in every Space, a full-screen call included, as Zoom's floating controls.
+            window.level = .floating
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window.setFrameAutosaveName("RecordingWindow")
             if !window.setFrameUsingName("RecordingWindow") { window.center() }
             self.window = window
@@ -25,6 +31,11 @@ final class RecordingWindow {
     }
 
     func close() { window?.close() }
+}
+
+/// The first click on Pause or Stop acts even while the call app is in front, instead of only bringing the panel forward.
+private final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 /// Timer, a moving waveform, Pause, Stop and the way back to the library.

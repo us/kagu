@@ -12,11 +12,31 @@ final class Player {
     private var timer: Timer?
     private var url: URL?
     var isLoaded: Bool { player != nil }
+    /// The file could not be opened for playing (damaged, or a format that will not decode).
+    private(set) var failed = false
+
+    /// The speeds offered, as Podcasts offers them.
+    static let rates: [Float] = [1, 1.25, 1.5, 2]
+    static func name(_ rate: Float) -> String { "\(rate.formatted())\u{00D7}" }  // "1.25×"
+
+    /// The playback speed, the same for every recording and kept across launches.
+    var rate: Float = {
+        let saved = UserDefaults.standard.float(forKey: "playbackRate")
+        return Player.rates.contains(saved) ? saved : 1
+    }() {
+        didSet {
+            player?.rate = rate
+            UserDefaults.standard.set(rate, forKey: "playbackRate")
+        }
+    }
 
     func load(_ url: URL) {
         stop()
         self.url = url
         player = try? AVAudioPlayer(contentsOf: url)
+        failed = player == nil
+        player?.enableRate = true  // before prepareToPlay, or the rate is ignored
+        player?.rate = rate
         player?.prepareToPlay()
         duration = player?.duration ?? 0
         time = 0

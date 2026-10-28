@@ -33,6 +33,7 @@ final class Updater: NSObject, SPUUpdaterDelegate, SPUStandardUserDriverDelegate
     private func hold(_ install: @escaping () -> Void, quietly: Bool) {
         pending = (install, quietly)
         log("update: waiting until Kagu is free\(quietly ? " and in the background" : "")")
+        if !quietly { model.tell("The update installs once the recording and transcripts are done.", lasting: true) }  // the button was pressed: say why nothing happens
         if timer == nil {
             let timer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.tryInstall() } }
             RunLoop.main.add(timer, forMode: .common)

@@ -13,6 +13,7 @@ struct RecordingItem: Identifiable, Hashable, Sendable {
     var accession: String?  // "2026.43": its entry in the register, see `Register`
     var folder: String?  // the subfolder of the Recordings folder it lives in; nil for the top
     var preview = ""  // the first words of the transcript, read once in the scan (not on every redraw)
+    var spoken = ""  // what was said, without the transcript's header and speaker lines: what the search looks in
 
     var id: URL { url }
     var stem: String { url.deletingPathExtension().lastPathComponent }
@@ -27,7 +28,7 @@ struct RecordingItem: Identifiable, Hashable, Sendable {
     func moved(to url: URL, folder: String?) -> RecordingItem {
         let stem = url.deletingPathExtension().lastPathComponent
         let transcript = transcript.map { url.deletingLastPathComponent().appending(path: stem + $0.lastPathComponent.dropFirst(self.stem.count)) }
-        return RecordingItem(url: url, date: date, duration: duration, transcript: transcript, transcriptText: transcriptText, tags: tags, colors: colors, accession: accession, folder: folder, preview: preview)
+        return RecordingItem(url: url, date: date, duration: duration, transcript: transcript, transcriptText: transcriptText, tags: tags, colors: colors, accession: accession, folder: folder, preview: preview, spoken: spoken)
     }
 }
 
@@ -131,8 +132,9 @@ final class Library {
             let text = transcript.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
             // A default name holds the moment the recording started; the file date is when it was saved (later, for a recovered one).
             let started = DateFormatter.recordingStamp.date(from: String(stem.lastPathComponent.dropFirst("Recording ".count).prefix(19)))
-            let preview = Transcript.parse(text).first.map { String($0.text.prefix(160)) } ?? (transcript != nil ? "No speech found" : "No transcript")
-            items.append(RecordingItem(url: url, date: stem.lastPathComponent.hasPrefix("Recording ") ? started ?? values?.creationDate ?? modified : values?.creationDate ?? modified, duration: duration, transcript: transcript, transcriptText: text, tags: values?.tagNames ?? [], colors: tagColors(of: url), accession: Register.read(url), folder: place.name, preview: preview))
+            let blocks = Transcript.parse(text)
+            let preview = blocks.first.map { String($0.text.prefix(160)) } ?? (transcript != nil ? "No speech found" : "No transcript")
+            items.append(RecordingItem(url: url, date: stem.lastPathComponent.hasPrefix("Recording ") ? started ?? values?.creationDate ?? modified : values?.creationDate ?? modified, duration: duration, transcript: transcript, transcriptText: text, tags: values?.tagNames ?? [], colors: tagColors(of: url), accession: Register.read(url), folder: place.name, preview: preview, spoken: blocks.map(\.text).joined(separator: "\n")))
         }
         }
         return (items.sorted { $0.date > $1.date }, durations, subfolders)
@@ -361,16 +363,61 @@ final class Library {
         return url
     }
 
+    /// The window's undo manager: a trash is registered there, so Edit > Undo puts the recording back.
+    @ObservationIgnored weak var undoManager: UndoManager?
+    /// Told after Undo Move to Trash: the recording when its audio is back, and why a part could not come back.
+    @ObservationIgnored var onPutBack: ((_ item: RecordingItem?, _ problem: String?) -> Void)?
+
+    /// Told before a recording goes to the Trash, from any place that trashes it: the list moves its selection on.
+    @ObservationIgnored var willTrash: ((RecordingItem) -> Void)?
+
     /// Moves a recording, its transcript and its sidecar to the Trash (they can be put back from there).
     func trash(_ item: RecordingItem) {
+        willTrash?(item)
         let files = Self.parts(of: item.url).filter { Self.isFile($0) }
         trashing.insert(item.url)
-        NSWorkspace.shared.recycle(files) { [weak self] _, _ in
+        NSWorkspace.shared.recycle(files) { [weak self] trashed, _ in
             Task { @MainActor in
-                self?.trashing.remove(item.url)
-                self?.reload()
+                guard let self else { return }
+                self.trashing.remove(item.url)
+                self.reload()
+                        guard !trashed.isEmpty, let undoManager = self.undoManager else { return }
+                undoManager.beginUndoGrouping()  // its own group, so the menu reads "Undo Move to Trash"
+                undoManager.registerUndo(withTarget: self) { $0.putBack(trashed, of: item) }
+                undoManager.setActionName("Move to Trash")
+                undoManager.endUndoGrouping()
             }
         }
+    }
+
+    /// Undo of `trash`, as Finder's Put Back: every part from the Trash to where it was. The audio goes first;
+    /// when it cannot come back, nothing else does, so no transcript is left without its recording.
+    private func putBack(_ trashed: [URL: URL], of item: RecordingItem) {
+        var failed: [String] = []
+        var back = trashed[item.url] == nil  // its own audio, not a file that took its name since
+        for (place, inTrash) in trashed.sorted(by: { $0.key == item.url && $1.key != item.url }) {
+            let name = place == item.url ? "the audio" : String(place.lastPathComponent.drop { $0 == "." })
+            if FileManager.default.fileExists(atPath: place.path) {
+                failed.append("\(name) has a file of the same name in its place")
+            } else {
+                do {
+                    // Finder recreates a folder that is gone (a folder deleted since); so does this.
+                    try FileManager.default.createDirectory(at: place.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try FileManager.default.moveItem(at: inTrash, to: place)
+                    if place == item.url { back = true }
+                    continue
+                } catch {
+                    log("put back failed: \(error)")
+                    failed.append(FileManager.default.fileExists(atPath: inTrash.path) ? "\(name) could not be moved (\(error.localizedDescription))" : "\(name) is no longer in the Trash")
+                }
+            }
+            if place == item.url { break }
+        }
+        reload()
+        let problem = failed.isEmpty ? nil
+            : back ? "\(item.displayTitle) is back, but \(failed.formatted(.list(type: .and)))."
+            : "Could not put \(item.displayTitle) back: \(failed.formatted(.list(type: .and)))."
+        onPutBack?(back ? item : nil, problem)
     }
 
     /// Finder keeps a tag's color next to its name ("Red\n6") in this attribute; `tagNamesKey` gives only the names.

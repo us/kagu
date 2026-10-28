@@ -38,8 +38,9 @@ struct SearchField: View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary).imageScale(.small)
             TextField(prompt, text: $text).textFieldStyle(.plain).focused(focus)
+                .onExitCommand { text = "" }  // Esc clears, as in a search field
             if !text.isEmpty {
-                Button { text = "" } label: { Image(systemName: "xmark.circle.fill") }
+                Button { text = "" } label: { Image(systemName: "xmark.circle.fill").contentShape(Rectangle().inset(by: -5)) }  // a 24 pt target without a taller field
                     .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("Clear search")
             }
         }

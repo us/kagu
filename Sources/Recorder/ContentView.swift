@@ -7,6 +7,22 @@ enum Scope: Hashable {
     case all
     case folder(String?)
     case tag(String)
+
+    /// "all", "folder" (the Recordings folder), "folder:Name" or "tag:Name", kept between launches.
+    var stored: String {
+        switch self {
+        case .all: "all"
+        case .folder(let name): name.map { "folder:" + $0 } ?? "folder"
+        case .tag(let tag): "tag:" + tag
+        }
+    }
+
+    init(stored: String) {
+        if stored == "folder" { self = .folder(nil) }
+        else if stored.hasPrefix("folder:") { self = .folder(String(stored.dropFirst("folder:".count))) }
+        else if stored.hasPrefix("tag:") { self = .tag(String(stored.dropFirst("tag:".count))) }
+        else { self = .all }
+    }
 }
 
 /// Three columns, like Notes: folders and tags | the recordings in the chosen one | the recording.
@@ -16,15 +32,22 @@ struct ContentView: View {
     @State private var selection: URL?
     @State private var search = ""
     @State private var scope = Scope.all
-    @State private var columns = NavigationSplitViewVisibility.all
     @State private var renaming: String?  // the folder whose name is being edited
     @State private var draft = ""
     @State private var request: DetailRequest?  // Rename or New Tag from a row's menu, for the recording's page
+    @State private var findsInTranscript = false  // the recording's page has its transcript search on view
     @FocusState private var searchFocused: Bool
     @FocusState private var listFocused: Bool
     @FocusState private var renameFocused: Bool
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.undoManager) private var undoManager
+    // Where the window was left, to reopen there. App storage, not scene storage: with "Close windows when
+    // quitting an application" on (the macOS default) a scene's storage does not survive a quit.
+    @AppStorage("lastScope") private var lastScope = "all"
+    @AppStorage("lastSelection") private var lastSelection = ""  // the recording's path
+    /// A `--library` test folder neither reads nor writes the owner's place.
+    private let remembers = !CommandLine.arguments.dropFirst().contains { $0.hasPrefix("--") }  // no test aid at all
 
     private var library: Library { model.library }
     private var transcriber: Transcriber { model.transcriber }
@@ -47,13 +70,24 @@ struct ContentView: View {
     private var shown: [RecordingItem] {
         let scoped = library.items.filter { inScope($0, scope) }
         guard !search.isEmpty else { return scoped }
-        return scoped.filter {
-            $0.displayTitle.localizedCaseInsensitiveContains(search)
-                || $0.stem.localizedCaseInsensitiveContains(search)
-                || $0.transcriptText.localizedCaseInsensitiveContains(search)
-                || $0.tags.contains { $0.localizedCaseInsensitiveContains(search) }
-                || $0.accession == search
-        }
+        return scoped.filter { matchesLabel($0) || $0.spoken.range(of: search, options: [.caseInsensitive, .diacriticInsensitive]) != nil }
+    }
+
+    /// The search is in what the row already shows: its title, file name, tags or number.
+    private func matchesLabel(_ item: RecordingItem) -> Bool {
+        Self.has(item.displayTitle, search) || Self.has(item.stem, search) || item.tags.contains { Self.has($0, search) } || item.accession == search
+    }
+
+    /// Case and accents ignored, as the transcript search.
+    private static func has(_ text: String, _ term: String) -> Bool {
+        text.range(of: term, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    /// While searching, a row found only by its transcript previews the words around the match instead of the first ones.
+    /// Called as a row is drawn, so only the rows on screen pay for it.
+    private func snippet(_ item: RecordingItem) -> AttributedString? {
+        guard !search.isEmpty, !matchesLabel(item) else { return nil }
+        return transcriptSnippet(item.transcriptText, search)
     }
 
     private var scopeTitle: String {
@@ -111,29 +145,17 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columns) {
-            sidebar
-                .frame(minWidth: 220)
-                .navigationSplitViewColumnWidth(220)  // fixed: a saved narrower width would cut the folder names
-                .toolbar(removing: .sidebarToggle)
-        } content: {
-            list
-                .frame(minWidth: 290)
-                .navigationSplitViewColumnWidth(min: 290, ideal: 310, max: 400)
-        } detail: {
-            Group {
-                if isEmpty {
-                    EmptyLibrary(model: model)
-                } else if let item = selectedItem {
-                    // Only while it is still the one shown: a title committed as another row is clicked must not pull the selection back.
-                    DetailView(item: item, model: model, player: model.player, hint: search, request: $request) { old, new in if selection == old { selection = new } }.id(item.id)
-                } else {
-                    ContentUnavailableView("Select a Recording", systemImage: "waveform")
-                }
+        Group {
+            if isEmpty {
+                // The welcome alone: a split view does not hide its two leading columns on macOS.
+                EmptyLibrary(model: model).frame(maxWidth: .infinity, maxHeight: .infinity).background(Theme.canvas)
+            } else {
+                splitView
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Theme.canvas)
         }
+        .focusedSceneValue(\.recording, selectedItem.map { item in
+            RecordingCommands(rename: { open(item, .rename) }, reveal: { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }, trash: { trash(item) })
+        })
         .navigationTitle(selectedItem?.displayTitle ?? "Recordings")
         .toolbar(removing: .title)  // the recording's own title is already large in the detail pane
         .toolbarBackground(.hidden, for: .windowToolbar)
@@ -150,8 +172,20 @@ struct ContentView: View {
             return .handled
         }
         .onAppear {
-            columns = isEmpty ? .detailOnly : .all
             model.openMainWindow = { [openWindow] in openWindow(id: "main") }
+            library.undoManager = undoManager
+            library.willTrash = { leave($0) }
+            library.onPutBack = { item, problem in
+                if let problem { model.show(problem) }
+                guard let item else { return }
+                if !inScope(item, scope) { scope = .all }
+                selection = item.id
+            }
+            // Where it was left; the test aids below win over it.
+            if remembers {
+                scope = Scope(stored: lastScope)
+                if !lastSelection.isEmpty { selection = URL(fileURLWithPath: lastSelection) }
+            }
             // Test aids: `--select <file name>` opens that recording, `--search <text>` fills the search box, `--settings` opens Settings, `--import` the Transcribe Audio File window, `--folder <name>` shows one folder.
             if let i = CommandLine.arguments.firstIndex(of: "--search"), i + 1 < CommandLine.arguments.count {
                 search = CommandLine.arguments[i + 1]
@@ -164,10 +198,15 @@ struct ContentView: View {
             if let i = CommandLine.arguments.firstIndex(of: "--select"), i + 1 < CommandLine.arguments.count {
                 selection = library.folder.appending(path: CommandLine.arguments[i + 1])
             }
+            settleRestored()
         }
-        .onChange(of: isEmpty) { _, empty in columns = empty ? .detailOnly : .all }
+        .onChange(of: library.loaded) { settleRestored() }
+        .onChange(of: undoManager) { library.undoManager = undoManager }
         .onChange(of: library.allTags) { _, tags in if case .tag(let chosen) = scope, !tags.contains(chosen) { scope = .all } }
-        .onChange(of: selection) { _, new in if request?.url != new { request = nil } }  // a request left over must not fire on a later visit
+        .onChange(of: selection) { _, new in
+            if request?.url != new { request = nil }  // a request left over must not fire on a later visit
+            if remembers { lastSelection = new?.path ?? "" }
+        }
         .onChange(of: library.folders) { _, folders in if case .folder(let name?) = scope, !folders.contains(name) { scope = .all } }
         .onChange(of: model.lastFile) { _, file in
             library.reload()
@@ -177,7 +216,7 @@ struct ContentView: View {
             selection = file
         }
         // Another folder, tag or search: what was selected may not be in the list any more. As in Notes, the first one shown is.
-        .onChange(of: scope) { keepSelectionShown() }
+        .onChange(of: scope) { keepSelectionShown(); if remembers { lastScope = scope.stored } }
         .onChange(of: search) { keepSelectionShown() }
     }
 
@@ -250,6 +289,30 @@ struct ContentView: View {
         }
     }
 
+    private var splitView: some View {
+        NavigationSplitView {
+            sidebar
+                .frame(minWidth: 220)
+                .navigationSplitViewColumnWidth(220)  // fixed: a saved narrower width would cut the folder names
+                .toolbar(removing: .sidebarToggle)
+        } content: {
+            list
+                .frame(minWidth: 290)
+                .navigationSplitViewColumnWidth(min: 290, ideal: 310, max: 400)
+        } detail: {
+            Group {
+                if let item = selectedItem {
+                    // Only while it is still the one shown: a title committed as another row is clicked must not pull the selection back.
+                    DetailView(item: item, model: model, player: model.player, hint: search, request: $request, findsInTranscript: $findsInTranscript) { old, new in if selection == old { selection = new } }.id(item.id)
+                } else {
+                    ContentUnavailableView("Select a Recording", systemImage: "waveform")
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.canvas)
+        }
+    }
+
     // MARK: List
 
     private var list: some View {
@@ -265,12 +328,17 @@ struct ContentView: View {
             SearchField(prompt: "Search recordings...", text: $search, focus: $searchFocused)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
+            // Above the list, not in it: a notice must show however far the list is scrolled.
+            if let text = model.message {
+                NoticeRow(text: text, report: model.report, link: model.messageLink, isNews: model.messageIsNews, isBusy: model.messageIsBusy, dismiss: model.dismissMessage)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        if model.message != nil || model.state != .idle || !outsideFiles.isEmpty {
+                        if model.state != .idle || !outsideFiles.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
-                                if let text = model.message { NoticeRow(text: text, report: model.report, link: model.messageLink, dismiss: model.dismissMessage) }
                                 if model.state != .idle { LiveRow(model: model) }
                                 ForEach(outsideFiles, id: \.self) { OutsideRow(url: $0, transcriber: transcriber) }
                             }
@@ -285,7 +353,8 @@ struct ContentView: View {
                                 Text(title).font(.system(size: 15, weight: .bold)).padding(.horizontal, 8).padding(.top, 10).padding(.bottom, 6)
                                     .accessibilityAddTraits(.isHeader)
                             case .row(let item, let next):
-                                ListRow(item: item, state: transcriber.states[item.url], selected: item.id == selection, showFolder: !isFolderScope && !library.folders.isEmpty)  // with no folders every row would say Recordings
+                                ListRow(item: item, state: transcriber.states[item.url], selected: item.id == selection, showFolder: !isFolderScope && !library.folders.isEmpty,  // with no folders every row would say Recordings
+                                        snippet: snippet(item))
                                     .contentShape(Rectangle())
                                     .onTapGesture { selection = item.id; listFocused = true }
                                     .accessibilityAction { selection = item.id; listFocused = true }  // VoiceOver and keyboard access select it too
@@ -304,6 +373,9 @@ struct ContentView: View {
                 .focusable()
                 .focused($listFocused)
                 .focusEffectDisabled()
+                .onChange(of: selection) { _, new in if let new { proxy.scrollTo(new) } }
+                .onChange(of: library.loaded) { if let selection { proxy.scrollTo(selection) } }  // the place restored before the rows were read
+                .onChange(of: scope) { if let selection { proxy.scrollTo(selection) } }
                 .onMoveCommand { direction in moveSelection(direction, ids: sections.flatMap { $0.items.map(\.id) }, proxy: proxy) }
                 .onDeleteCommand { if let item = selectedItem, shown.contains(where: { $0.id == item.id }) { trash(item) } }
                 // Audio files from Finder (a phone recording) land in the folder on screen.
@@ -315,7 +387,13 @@ struct ContentView: View {
                 }
                 .overlay {
                     if shown.isEmpty, !search.isEmpty {
-                        ContentUnavailableView.search(text: search)
+                        ContentUnavailableView {
+                            Label("No Results", systemImage: "magnifyingglass")
+                        } description: {
+                            Text("Nothing in \(scopeTitle) matches \u{201C}\(search)\u{201D}.")
+                        } actions: {
+                            if scope != .all { Button("Search All Recordings") { scope = .all } }
+                        }
                     } else if shown.isEmpty, model.state == .idle {
                         ContentUnavailableView(isFolderScope ? "Empty Folder" : "No Recordings", systemImage: isFolderScope ? "folder" : "waveform",
                                                description: Text(isFolderScope ? "Drag a recording onto this folder in the sidebar, or use Move to in its menu." : ""))
@@ -325,7 +403,12 @@ struct ContentView: View {
         }
         .background(Theme.canvas)
         .background {
-            Button("") { searchFocused = true }.keyboardShortcut("f").hidden()  // ⌘F focuses the search field
+            // ⌘F finds in the open transcript when its search field is on view, else in the recordings, as Notes; ⌥⌘F always the recordings.
+            Button("") {
+                if findsInTranscript, let item = selectedItem { request = DetailRequest(url: item.url, kind: .find) } else { searchFocused = true }
+            }
+            .keyboardShortcut("f").hidden()
+            Button("") { searchFocused = true }.keyboardShortcut("f", modifiers: [.command, .option]).hidden()
         }
     }
 
@@ -421,8 +504,10 @@ struct ContentView: View {
             if scope == .folder(name) { scope = .folder(new) }
             if let item = selectedItem, item.folder == name { selection = library.directory(new).appending(path: item.url.lastPathComponent) }
         } else if case let clean = Library.cleanName(draft), !clean.isEmpty, clean != name {  // an emptied or unchanged name keeps the old one
-            model.show(FileManager.default.fileExists(atPath: library.folder.appending(path: clean).path)
-                ? "A folder called \(clean) already exists." : "A folder cannot be called \(clean).")
+            model.tell(FileManager.default.fileExists(atPath: library.folder.appending(path: clean).path)
+                ? "A folder called \(clean) already exists. Choose another name." : "A folder cannot be called \(clean). Choose another name.")
+            renaming = name  // the field stays open with what was typed
+            renameFocused = true
         }
     }
 
@@ -457,7 +542,22 @@ struct ContentView: View {
         selection = visible.first?.id  // also after a search that matched nothing is cleared
     }
 
-    private func trash(_ item: RecordingItem) {
+    /// Once the folder is read: a folder or tag that is gone since the last launch gives way to all recordings,
+    /// a recording that is gone to the newest one shown.
+    private func settleRestored() {
+        guard library.loaded else { return }
+        switch scope {
+        case .folder(let name?) where !library.folders.contains(name): scope = .all
+        case .tag(let tag) where !library.allTags.contains(tag): scope = .all
+        default: break
+        }
+        if !shown.contains(where: { $0.id == selection }) { selection = shown.first?.id }  // gone, or not in the scope restored
+    }
+
+    private func trash(_ item: RecordingItem) { library.trash(item) }
+
+    /// `Library.willTrash`: whatever trashed it, its transcript job stops and the selection moves on.
+    private func leave(_ item: RecordingItem) {
         transcriber.cancel(item.url)  // a job for a recording that is going away would only leave an orphan transcript
         if selection == item.id {
             // The next row takes its place, or the one before at the end, as in Notes and Mail.
@@ -465,7 +565,31 @@ struct ContentView: View {
             let i = ids.firstIndex(of: item.id)
             selection = i.flatMap { ids.indices.contains($0 + 1) ? ids[$0 + 1] : $0 > 0 ? ids[$0 - 1] : nil }
         }
-        library.trash(item)
+    }
+}
+
+/// The selected recording's actions for the Recording menu, so they are in the menu bar and not only in context menus.
+struct RecordingCommands {
+    let rename: () -> Void
+    let reveal: () -> Void
+    let trash: () -> Void
+}
+
+extension FocusedValues {
+    @Entry var recording: RecordingCommands?
+}
+
+/// Recording menu: what a row's context menu does, for the keyboard and the menu bar (as Notes and Finder).
+struct RecordingMenu: Commands {
+    @FocusedValue(\.recording) private var recording
+
+    var body: some Commands {
+        CommandMenu("Recording") {
+            Button("Rename") { recording?.rename() }.disabled(recording == nil)
+            Button("Show in Finder") { recording?.reveal() }.keyboardShortcut("r", modifiers: [.command, .option]).disabled(recording == nil)
+            Divider()
+            Button("Move to Trash") { recording?.trash() }.disabled(recording == nil)  // the Delete key does it too
+        }
     }
 }
 
@@ -503,7 +627,7 @@ private struct SourceRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(title), \(count)")
+        .accessibilityLabel("\(title), \(count == 1 ? "1 recording" : "\(count) recordings")")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
@@ -514,10 +638,11 @@ private struct ListRow: View {
     let state: Transcriber.State?
     let selected: Bool
     let showFolder: Bool
+    var snippet: AttributedString?  // while searching: the words around the match, in place of the first words
     @Environment(\.colorScheme) private var scheme
 
     private var solid: Bool { selected && scheme == .dark }
-    private var secondary: Color { solid ? Color.white.opacity(0.8) : .secondary }
+    private var secondary: Color { solid ? Color.white : .secondary }  // white at 80% on the red fill was 3.8:1
 
     private var when: String {
         Calendar.current.isDateInToday(item.date) ? item.date.formatted(date: .omitted, time: .shortened)
@@ -533,7 +658,8 @@ private struct ListRow: View {
         case .failed: "transcript failed"
         case nil: item.transcript != nil ? "transcribed" : nil
         }
-        return ([when, status, showFolder ? item.folder ?? "Recordings" : nil] + item.tags).compactMap { $0 }.joined(separator: ", ")
+        let found = snippet.map { "found in the transcript: " + String($0.characters) }
+        return ([when, status, showFolder ? item.folder ?? "Recordings" : nil] + item.tags + [found]).compactMap { $0 }.joined(separator: ", ")
     }
 
     var body: some View {
@@ -545,7 +671,7 @@ private struct ListRow: View {
             }
             HStack(spacing: 6) {
                 Text(when).font(.caption.weight(.medium))
-                Text(item.preview).font(.caption).foregroundStyle(secondary).lineLimit(1)
+                Text(snippet ?? AttributedString(item.preview)).font(.caption).foregroundStyle(secondary).lineLimit(1)
             }
             switch state {
             case .queued, .downloadingModel:
@@ -608,6 +734,33 @@ func spoken(_ seconds: Double) -> String {
     Duration.seconds(seconds.rounded()).formatted(.units(allowed: [.hours, .minutes, .seconds], width: .wide))
 }
 
+/// The sentence where a transcript first says `term`, starting a few words before it when the sentence is long
+/// (the row shows one line), the term in bold. Nil when it is only in the title, a speaker's name or the model line.
+func transcriptSnippet(_ text: String, _ term: String) -> AttributedString? {
+    // What was said starts at the first speaker line; the speaker lines themselves ("**Me** `00:00:03`") are skipped.
+    guard var from = text.range(of: "\n**")?.lowerBound else { return nil }
+    while let hit = text.range(of: term, options: [.caseInsensitive, .diacriticInsensitive], range: from..<text.endIndex, locale: .current) {
+        let line = text.lineRange(for: hit)
+        if text[line].hasPrefix("**") { from = line.upperBound; continue }
+        var sentence = line
+        text.enumerateSubstrings(in: line, options: .bySentences) { _, range, _, stop in
+            if range.contains(hit.lowerBound) { sentence = range; stop = true }
+        }
+        var start = sentence.lowerBound
+        if text.distance(from: start, to: hit.lowerBound) > 24 {
+            let near = text.index(hit.lowerBound, offsetBy: -24)
+            start = text[near..<hit.lowerBound].firstIndex(where: \.isWhitespace).map { text.index(after: $0) } ?? hit.lowerBound
+        }
+        var end = max(hit.upperBound, text.index(hit.upperBound, offsetBy: 80, limitedBy: sentence.upperBound) ?? sentence.upperBound)  // a term across two sentences
+        if end < sentence.upperBound, let space = text[hit.upperBound..<end].lastIndex(where: \.isWhitespace) { end = space }  // a whole word
+        var bold = AttributedString(text[hit])
+        bold.inlinePresentationIntent = .stronglyEmphasized
+        return AttributedString((start > sentence.lowerBound ? "..." : "") + text[start..<hit.lowerBound]) + bold
+            + AttributedString(String(text[hit.upperBound..<end]).replacing(/\s+$/, with: ""))
+    }
+    return nil
+}
+
 func duration(_ seconds: Double) -> String {
     let s = Int(seconds.rounded())
     return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
@@ -621,7 +774,10 @@ private struct LiveRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(model.state == .saving ? "Saving" : "New Recording").font(.body.weight(.medium)).foregroundStyle(.red)
+                Label {
+                    Text(model.state == .saving ? "Saving" : "New Recording")  // primary: red text on the canvas was 3.3:1
+                } icon: { Image(systemName: "circle.fill").foregroundStyle(.red).imageScale(.small) }
+                .font(.body.weight(.medium))
                 Spacer()
                 Text(model.isPaused ? "Paused  \(duration(model.elapsed))" : duration(model.elapsed)).font(.subheadline).monospacedDigit().foregroundStyle(.secondary)
             }
@@ -643,16 +799,20 @@ private struct LiveRow: View {
             }
             if let warning = model.warning {
                 Label(warning, systemImage: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.caption).foregroundStyle(.secondary)
+                if let link = model.warningLink { Button("Open System Settings") { NSWorkspace.shared.open(link) }.controlSize(.small) }
             }
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .onTapGesture { model.showRecordingWindow() }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(model.state == .saving ? "Saving the recording" : "Recording")
-        .accessibilityValue(model.warning ?? "")
+        .accessibilityLabel(model.state == .saving ? "Saving the recording" : model.isPaused ? "Recording, paused" : "Recording")
+        .accessibilityValue([spoken(Double(model.wholeSeconds)), model.warning].compactMap { $0 }.joined(separator: ", "))
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { model.showRecordingWindow() }
+        .accessibilityActions {
+            if let link = model.warningLink { Button("Open System Settings") { NSWorkspace.shared.open(link) } }  // the button inside is hidden from VoiceOver
+        }
     }
 }
 
@@ -677,18 +837,22 @@ private struct NoticeRow: View {
     let text: String
     let report: Int?
     let link: URL?
+    var isNews = false
+    var isBusy = false
     let dismiss: () -> Void
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
+            if isBusy { ProgressView().controlSize(.small) } else {
+                Image(systemName: isNews ? "checkmark.circle.fill" : "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
                 // An error is filed: where its line is in the log, for whoever looks into it.
                 if let report {
                     Text("Condition report: line \(report) of Recorder.log.").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
-                if let link { Button("Open System Settings") { NSWorkspace.shared.open(link) }.controlSize(.small).padding(.top, 2) }
+                if let link { Button(link.isFileURL ? "Show in Finder" : "Open System Settings") { NSWorkspace.shared.open(link) }.controlSize(.small).padding(.top, 2) }
             }
             Spacer(minLength: 0)
             Button(action: dismiss) { Image(systemName: "xmark") }.buttonStyle(.plain).foregroundStyle(.secondary).frame(minWidth: 24, minHeight: 24).contentShape(Rectangle()).accessibilityLabel("Dismiss")
@@ -764,7 +928,7 @@ private struct TagStrip: View {
                 }
                 .buttonStyle(.plain)
                 .help(on ? "Show all recordings" : "Show recordings tagged \(item.tag)")
-                .accessibilityLabel("\(item.tag), \(item.count)")
+                .accessibilityLabel("\(item.tag), \(item.count == 1 ? "1 recording" : "\(item.count) recordings")")
                 .accessibilityAddTraits(on ? .isSelected : [])
             }
         }
