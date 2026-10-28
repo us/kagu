@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/us/kagu/compare/v0.2.3...v0.2.4) (2026-10-28)
+
+
+### Features
+
+* open at login so calls are noticed without opening Kagu ([64c5571](https://github.com/us/kagu/commit/64c55711febda7789ce9cb0ae34a71eb1d263926))
+
 ## [0.2.3](https://github.com/us/kagu/compare/v0.2.2...v0.2.3) (2026-10-28)
 
 
