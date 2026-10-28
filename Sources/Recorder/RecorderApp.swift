@@ -36,6 +36,11 @@ struct RecorderApp: App {
             CommandMenu("Playback") {
                 Button("Play or Pause") { delegate.model.player.toggle() }.keyboardShortcut(.space, modifiers: .option)
                     .disabled(!delegate.model.player.isLoaded)
+                // The keys are the plain arrows, outside text fields (ContentView); a menu shortcut would take them from text fields.
+                Button("Skip Back 15 Seconds") { delegate.model.player.skip(-15) }
+                    .disabled(!delegate.model.player.isLoaded)
+                Button("Skip Forward 15 Seconds") { delegate.model.player.skip(15) }
+                    .disabled(!delegate.model.player.isLoaded)
             }
         }
         Window("Transcribe Audio File", id: "import") {
@@ -200,6 +205,8 @@ final class Recorder {
     private(set) var message: String?
     /// The log line of the error in `message`, shown under it as its condition report.
     private(set) var report: Int?
+    /// A System Settings pane the notice can open (the mic permission).
+    private(set) var messageLink: URL?
     /// While saving: when it began and how long it should take, from this Mac's earlier saves.
     private(set) var savingSince: Date?
     private(set) var savingEstimate: Double?
@@ -228,6 +235,10 @@ final class Recorder {
     /// For the warning about missing system audio permission: how long something played, and the loudest Mac sample so far.
     private var outputTicks = 0
     private var systemPeakEver: Float = 0
+    /// Set every 5 s while recording when the disk has under 15 minutes of room left.
+    private var lowDisk: String?
+    /// Warnings already sent as a notification during this recording: each once, however often it comes and goes.
+    private var alerted: Set<String> = []
 
     init() {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -245,7 +256,14 @@ final class Recorder {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.stop(reason: "Saved because the Mac went to sleep.") }
         }
+        // A save that failed on a full disk is kept as a leftover; switching back to Kagu after freeing space saves it.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { if let self, self.state == .idle, self.freeBytes > 1 << 30 { self.recoverLeftovers() } }
+        }
     }
+
+    /// Free bytes on the recordings volume as `start()` counts them (space macOS can purge included), read fresh each time.
+    private var freeBytes: Int { (try? URL(fileURLWithPath: folder.path).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage).map(Int.init) ?? .max }
 
     func toggle() {
         switch state {
@@ -265,9 +283,9 @@ final class Recorder {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: break
         case .notDetermined:
-            guard await AVCaptureDevice.requestAccess(for: .audio) else { return fail("Kagu needs the microphone. Allow it in System Settings, Privacy & Security, Microphone.") }
+            guard await AVCaptureDevice.requestAccess(for: .audio) else { return fail(Self.micDenied, link: Self.micSettings) }
         default:
-            return fail("Kagu needs the microphone. Allow it in System Settings, Privacy & Security, Microphone.")
+            return fail(Self.micDenied, link: Self.micSettings)
         }
         let free = (try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage) ?? 0
         guard free > 1 << 30 else { return fail("Not enough disk space. Free up at least 1 GB to record.") }
@@ -293,6 +311,8 @@ final class Recorder {
             stalledTicks = 0
             outputTicks = 0
             systemPeakEver = 0
+            lowDisk = nil
+            alerted = []
             state = .recording
             recordingWindow.show(model: self)
             AccessibilityNotification.Announcement("Recording started").post()
@@ -320,7 +340,11 @@ final class Recorder {
         warning = nil
         micLevel = 0
         systemLevel = 0
-        if let reason { notify(reason) }
+        if let reason {
+            log("stopped: \(reason)")
+            notify(reason, expires: false)
+            CallWatcher.alert("Recording stopped", reason)  // a stop nobody asked for, maybe behind a full-screen call
+        }
         let keepRaw = keepRaw
         let m4a = Convert.finalURL(for: capture.url)
         let tracksFolder = Tracks.folder(stamp: m4a.deletingPathExtension().lastPathComponent)
@@ -338,7 +362,7 @@ final class Recorder {
                 if error == nil, let since = self.savingSince { SaveRate.record(saving: Date().timeIntervalSince(since), audio: seconds) }
                 self.savingSince = nil
                 self.savingEstimate = nil
-                if let error { self.fail("Could not finish saving: \(error.localizedDescription) The original audio is kept at \(capture.url.path).") } else if empty { self.fail("Nothing was recorded: the audio stream did not start.") } else { self.lastFile = m4a }
+                if let error { self.fail("Could not finish saving: \(error.localizedDescription) The audio is kept: free up disk space, then switch back to Kagu to save it.") } else if empty { self.fail("Nothing was recorded: the audio stream did not start.") } else { self.lastFile = m4a }
                 self.finishTracks(m4a: m4a, tracks: tracks)
                 self.becomeIdle()
             }
@@ -355,6 +379,7 @@ final class Recorder {
     func dismissMessage() {
         message = nil
         report = nil
+        messageLink = nil
     }
 
     /// Pause keeps the mic open but writes nothing; Resume carries on in the same file.
@@ -395,16 +420,26 @@ final class Recorder {
         stalledTicks = !isPaused && frames == lastFrames ? stalledTicks + 1 : 0
         lastFrames = frames
         if stalledTicks > 75 { return stop(reason: "Saved early: the audio stream stopped.") }  // 5 s
+        // The raw file grows 6 bytes a frame (3 channels of 16 bit); saving then needs room for the m4a and its tracks
+        // (about 25 KB a second together). `-diskReserveMB <n>` raises the floor, a test aid for this path.
+        if ticks % 75 == 0 {
+            let floor = 300_000_000 + Int(elapsed) * 30_000 + UserDefaults.standard.integer(forKey: "diskReserveMB") * 1_000_000
+            let free = freeBytes
+            if free < floor { return stop(reason: "Saved early: the disk is almost full.") }
+            let minutes = (free - floor) / Int(capture.sampleRate * 6 * 60)
+            lowDisk = minutes < 15 ? "The disk is almost full. Free up space, or Kagu saves and stops before it runs out." : nil
+        }
         // Without the system audio permission the tap delivers exact zeros while something plays.
         if !isPaused, ticks % 15 == 0, capture.outputIsPlayingElsewhere() { outputTicks += 15 }  // paused, nothing is heard on purpose
         let silent = !isPaused && capture.micZeroRun.load(ordering: .relaxed) > Int(capture.sampleRate)
         // A running output can be silent (a call before anyone talks), so a whole minute, and not one sample heard.
         let deaf = !isPaused && systemPeakEver == 0 && outputTicks >= 900
-        let text = silent ? "No sound from the mic. Another app may be using it, or Kagu has no mic access."
-            : deaf ? "No sound from the Mac yet. If you hear the call, allow Kagu in System Settings, Privacy & Security, Screen & System Audio Recording." : nil
-        if let text, warning == nil {
+        let text = lowDisk ?? (silent ? "No sound from the mic. Another app may be using it, or Kagu has no mic access."
+            : deaf ? "No sound from the Mac yet. If you hear the call, allow Kagu in System Settings, Privacy & Security, Screen & System Audio Recording." : nil)
+        if let text, text != warning {
             AccessibilityNotification.Announcement(text).post()
             log("warning: \(text)")
+            if alerted.insert(text).inserted { CallWatcher.alert("Kagu is still recording", text) }
         }
         warning = text
 
@@ -431,19 +466,26 @@ final class Recorder {
         waiters.forEach { $0() }
     }
 
+    static let micDenied = "Kagu needs the microphone. Allow it in System Settings, Privacy & Security, Microphone."
+    static let micSettings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+
     /// The notice is in the library window, so the window comes up when it is closed (a recording started from the menu bar).
-    private func fail(_ text: String) {
-        notify(text)
+    /// An error stays until it is dismissed: it may be read only after a call.
+    private func fail(_ text: String, link: URL? = nil) {
+        notify(text, expires: false)
         report = log("error: \(text)")
+        messageLink = link
         openMainWindow?()
+        CallWatcher.alert("Kagu", text)
     }
 
-    /// A short line at the top of the list; it goes away by itself.
-    private func notify(_ text: String) {
+    /// A short line at the top of the list; a confirmation goes away by itself.
+    private func notify(_ text: String, expires: Bool = true) {
         message = text
         report = nil
+        messageLink = nil
         AccessibilityNotification.Announcement(text).post()
-        guard !text.contains("/") else { return }  // a line that names a file stays until it is dismissed
+        guard expires, !text.contains("/") else { return }  // a line that names a file stays until it is dismissed
         Task {
             try? await Task.sleep(for: .seconds(12))
             if message == text { dismissMessage() }

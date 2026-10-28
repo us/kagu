@@ -141,7 +141,7 @@ final class ModelStore {
         case .failure(let error):
             if let data = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data { resumeData[model] = data }
             states[model] = .missing
-            message = "Download stopped: \(error.localizedDescription) Press Download to continue."
+            message = "Download stopped: \(error.localizedDescription) Try again to continue."
         case .success(let partial):
             states[model] = .verifying
             let target = stored(model)
@@ -169,7 +169,7 @@ final class ModelStore {
         }
         guard hash == expected else {
             try? FileManager.default.removeItem(at: partial)
-            throw RecorderError("The download is damaged and was deleted. Press Download to try again.")
+            throw RecorderError("The download is damaged and was deleted. Try again.")
         }
         try? FileManager.default.removeItem(at: target)
         try FileManager.default.moveItem(at: partial, to: target)

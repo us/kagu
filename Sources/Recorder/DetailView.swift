@@ -31,8 +31,12 @@ struct DetailView: View {
     @FocusState private var titleFocused: Bool
     @FocusState private var queryFocused: Bool
 
-    init(item: RecordingItem, model: Recorder, player: Player, request: Binding<DetailRequest?>, onRename: @escaping (_ old: URL, _ new: URL) -> Void) {
+    /// The library search: its words are marked in the transcript, and the first line with them is scrolled to.
+    let hint: String
+
+    init(item: RecordingItem, model: Recorder, player: Player, hint: String = "", request: Binding<DetailRequest?>, onRename: @escaping (_ old: URL, _ new: URL) -> Void) {
         self.item = item
+        self.hint = hint.trimmingCharacters(in: .whitespaces)
         self.model = model
         self.player = player
         _request = request
@@ -58,17 +62,25 @@ struct DetailView: View {
             }
             .padding(.horizontal, 32)
             .padding(.top, 10)
-            ScrollView {
-                Group {
-                    switch tab {
-                    case .transcript: transcript
-                    case .details: DetailsTable(item: item, folder: model.library.folder)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Group {
+                        switch tab {
+                        case .transcript: transcript
+                        case .details: DetailsTable(item: item, folder: model.library.folder)
+                        }
                     }
+                    .padding(.horizontal, 32)
+                    .padding(.top, 18)
+                    .padding(.bottom, 28)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(.horizontal, 32)
-                .padding(.top, 18)
-                .padding(.bottom, 28)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .task(id: hint) {
+                    try? await Task.sleep(for: .milliseconds(300))  // after typing settles, and after the lines are laid out
+                    guard !Task.isCancelled, !hint.isEmpty, query.isEmpty,
+                          let first = blocks.firstIndex(where: { $0.text.range(of: hint, options: [.caseInsensitive, .diacriticInsensitive]) != nil }) else { return }
+                    proxy.scrollTo(first, anchor: .top)
+                }
             }
         }
         .focusable()
@@ -248,7 +260,10 @@ struct DetailView: View {
             LazyVStack(alignment: .leading, spacing: 18) {
                 ForEach(shownBlocks, id: \.offset) { _, block in
                     HStack(alignment: .firstTextBaseline, spacing: 0) {
-                        Button(duration(block.seconds)) { player.seek(to: block.seconds) }
+                        Button(duration(block.seconds)) {
+                            player.seek(to: block.seconds)
+                            if !player.isPlaying { player.toggle() }
+                        }
                             .buttonStyle(.plain)
                             .font(.callout)
                             .foregroundStyle(.secondary)
@@ -297,9 +312,10 @@ struct DetailView: View {
     /// The search words get a soft red mark.
     private func highlighted(_ text: String) -> AttributedString {
         var result = AttributedString(text)
-        guard !query.isEmpty else { return result }
+        let mark = query.isEmpty ? hint : query
+        guard !mark.isEmpty else { return result }
         var searchFrom = result.startIndex
-        while let range = result[searchFrom...].range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) {
+        while let range = result[searchFrom...].range(of: mark, options: [.caseInsensitive, .diacriticInsensitive]) {
             result[range].backgroundColor = Theme.accent.opacity(0.22)
             searchFrom = range.upperBound
         }
@@ -502,7 +518,8 @@ private struct TranscribeControl: View {
                      : "No transcript yet. The first time, a speech model (\(transcriber.model.sizeText)) is downloaded once.")
                     .font(.callout).foregroundStyle(.secondary)
             case .queued:
-                progress(nil, transcriber.shouldPause() ? "Waiting for the recording to finish" : "Preparing")
+                progress(nil, transcriber.shouldPause() ? "Waiting for the recording to finish"
+                         : transcriber.isBusyElsewhere(item.url) ? "Waiting for another transcript to finish" : "Preparing")
             case .downloadingModel:
                 if case .downloading(let value) = transcriber.models.state(transcriber.model) { progress(value, "Downloading the speech model \(Int(value * 100))%") } else { progress(nil, "Checking the speech model") }
             case .running(let value):

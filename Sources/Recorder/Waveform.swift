@@ -8,7 +8,9 @@ enum Waveform {
 
     static func peaks(url: URL, count: Int = 96) async -> [Float] {
         if let hit = cache.withLock({ $0[url] }) { return hit }
-        let peaks = await Task.detached(priority: .utility) { compute(url, count) }.value
+        // Detached, so the caller's cancel (another row chosen) is passed on by hand; the read loop checks it.
+        let work = Task.detached(priority: .utility) { compute(url, count) }
+        let peaks = await withTaskCancellationHandler { await work.value } onCancel: { work.cancel() }
         if !peaks.isEmpty { cache.withLock { $0[url] = peaks } }
         return peaks
     }
@@ -27,7 +29,7 @@ enum Waveform {
         let total = Double(file.length)
         var peaks = [Float](repeating: 0, count: count)
         let step = 512
-        while file.framePosition < file.length {
+        while file.framePosition < file.length, !Task.isCancelled {
             let start = Double(file.framePosition)
             guard (try? file.read(into: buffer, frameCount: chunk)) != nil, buffer.frameLength > 0 else { break }
             let data = buffer.floatChannelData!
@@ -39,6 +41,7 @@ enum Waveform {
                 peaks[bucket] = max(peaks[bucket], peak)
             }
         }
+        if Task.isCancelled { return [] }  // never cached
         let top = peaks.max() ?? 0
         return top > 0 ? peaks.map { pow($0 / top, 0.6) } : peaks
     }

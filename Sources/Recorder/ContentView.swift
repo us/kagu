@@ -125,7 +125,7 @@ struct ContentView: View {
                     EmptyLibrary(model: model)
                 } else if let item = selectedItem {
                     // Only while it is still the one shown: a title committed as another row is clicked must not pull the selection back.
-                    DetailView(item: item, model: model, player: model.player, request: $request) { old, new in if selection == old { selection = new } }.id(item.id)
+                    DetailView(item: item, model: model, player: model.player, hint: search, request: $request) { old, new in if selection == old { selection = new } }.id(item.id)
                 } else {
                     ContentUnavailableView("Select a Recording", systemImage: "waveform")
                 }
@@ -141,6 +141,11 @@ struct ContentView: View {
         .onKeyPress(.space) {
             if NSApp.keyWindow?.firstResponder is NSText || !model.player.isLoaded { return .ignored }
             model.player.toggle()
+            return .handled
+        }
+        .onKeyPress(keys: [.leftArrow, .rightArrow]) { press in
+            if !press.modifiers.isEmpty || NSApp.keyWindow?.firstResponder is NSText || !model.player.isLoaded { return .ignored }
+            model.player.skip(press.key == .leftArrow ? -15 : 15)
             return .handled
         }
         .onAppear {
@@ -264,7 +269,7 @@ struct ContentView: View {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         if model.message != nil || model.state != .idle || !outsideFiles.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
-                                if let text = model.message { NoticeRow(text: text, report: model.report, dismiss: model.dismissMessage) }
+                                if let text = model.message { NoticeRow(text: text, report: model.report, link: model.messageLink, dismiss: model.dismissMessage) }
                                 if model.state != .idle { LiveRow(model: model) }
                                 ForEach(outsideFiles, id: \.self) { OutsideRow(url: $0, transcriber: transcriber) }
                             }
@@ -305,7 +310,7 @@ struct ContentView: View {
                         ContentUnavailableView.search(text: search)
                     } else if shown.isEmpty, model.state == .idle {
                         ContentUnavailableView(isFolderScope ? "Empty Folder" : "No Recordings", systemImage: isFolderScope ? "folder" : "waveform",
-                                               description: Text(isFolderScope ? "Drag recordings here from the list." : ""))
+                                               description: Text(isFolderScope ? "Drag a recording onto this folder in the sidebar, or use Move to in its menu." : ""))
                     }
                 }
             }
@@ -407,6 +412,9 @@ struct ContentView: View {
         if let new = library.renameFolder(name, to: draft) {
             if scope == .folder(name) { scope = .folder(new) }
             if let item = selectedItem, item.folder == name { selection = library.directory(new).appending(path: item.url.lastPathComponent) }
+        } else if case let clean = Library.cleanName(draft), !clean.isEmpty, clean != name {  // an emptied or unchanged name keeps the old one
+            model.show(FileManager.default.fileExists(atPath: library.folder.appending(path: clean).path)
+                ? "A folder called \(clean) already exists." : "A folder cannot be called \(clean).")
         }
     }
 
@@ -425,6 +433,8 @@ struct ContentView: View {
         switch direction {
         case .up: selection = ids[max(0, (index ?? 1) - 1)]
         case .down: selection = ids[min(ids.count - 1, (index ?? -1) + 1)]
+        case .left: return model.player.skip(-15)  // as the window's arrow keys, in case the list takes them first
+        case .right: return model.player.skip(15)
         default: return
         }
         if let selection { proxy.scrollTo(selection) }
@@ -441,7 +451,12 @@ struct ContentView: View {
 
     private func trash(_ item: RecordingItem) {
         transcriber.cancel(item.url)  // a job for a recording that is going away would only leave an orphan transcript
-        if selection == item.id { selection = nil }
+        if selection == item.id {
+            // The next row takes its place, or the one before at the end, as in Notes and Mail.
+            let ids = sections(shown).flatMap { $0.items.map(\.id) }
+            let i = ids.firstIndex(of: item.id)
+            selection = i.flatMap { ids.indices.contains($0 + 1) ? ids[$0 + 1] : $0 > 0 ? ids[$0 - 1] : nil }
+        }
         library.trash(item)
     }
 }
@@ -476,7 +491,7 @@ private struct SourceRow: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
-            .background(RoundedRectangle(cornerRadius: 7).fill(selected ? Theme.card : .clear))
+            .background(RoundedRectangle(cornerRadius: 7).fill(selected ? Theme.selection : .clear))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -500,6 +515,17 @@ private struct ListRow: View {
         Calendar.current.isDateInToday(item.date) ? item.date.formatted(date: .omitted, time: .shortened)
             : Calendar.current.isDate(item.date, equalTo: Date(), toGranularity: .weekOfYear) ? item.date.formatted(.dateTime.weekday(.wide))
             : item.date.formatted(date: .numeric, time: .omitted)
+    }
+
+    /// What the label leaves out: when, the transcript state, the folder and the tags.
+    private var spokenState: String {
+        let status: String? = switch state {
+        case .queued, .downloadingModel: "preparing a transcript"
+        case .running(let value): value > 0 ? "transcribing, \(Int(value * 100)) percent" : "transcribing"
+        case .failed: "transcript failed"
+        case nil: item.transcript != nil ? "transcribed" : nil
+        }
+        return ([when, status, showFolder ? item.folder ?? "Recordings" : nil] + item.tags).compactMap { $0 }.joined(separator: ", ")
     }
 
     var body: some View {
@@ -544,7 +570,7 @@ private struct ListRow: View {
         .padding(.vertical, 8)
         .background(RoundedRectangle(cornerRadius: 9).fill(selected ? (solid ? Theme.accent.opacity(0.8) : Theme.selection) : .clear))
         .accessibilityElement(children: .combine)
-        .accessibilityValue(item.transcript != nil ? "Transcribed" : "")
+        .accessibilityValue(spokenState)
         .accessibilityLabel("\(item.displayTitle), \(spoken(item.duration))")
         .accessibilityAddTraits(selected ? [.isSelected, .isButton] : .isButton)
     }
@@ -617,6 +643,8 @@ private struct LiveRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(model.state == .saving ? "Saving the recording" : "Recording")
         .accessibilityValue(model.warning ?? "")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { model.showRecordingWindow() }
     }
 }
 
@@ -636,10 +664,11 @@ private struct LiveBars: View {
     }
 }
 
-/// One short line at the top of the list (a saved-early reason, a missing permission). It goes away by itself.
+/// One short line at the top of the list (a saved-early reason, a missing permission). A confirmation goes away by itself.
 private struct NoticeRow: View {
     let text: String
     let report: Int?
+    let link: URL?
     let dismiss: () -> Void
 
     var body: some View {
@@ -651,6 +680,7 @@ private struct NoticeRow: View {
                 if let report {
                     Text("Condition report: line \(report) of Recorder.log.").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
+                if let link { Button("Open System Settings") { NSWorkspace.shared.open(link) }.controlSize(.small).padding(.top, 2) }
             }
             Spacer(minLength: 0)
             Button(action: dismiss) { Image(systemName: "xmark") }.buttonStyle(.plain).foregroundStyle(.secondary).frame(minWidth: 24, minHeight: 24).contentShape(Rectangle()).accessibilityLabel("Dismiss")

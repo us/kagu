@@ -149,9 +149,12 @@ final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
         let data = out.fileHandleForReading.readDataToEndOfFile()
         script.waitUntilExit()
         guard script.terminationStatus == 0 else {
-            log("calls: could not read Chrome tabs: \(String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))")
+            let text = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            log("calls: could not read Chrome tabs: \(text)")
+            if text.contains("-1743") { UserDefaults.standard.set(true, forKey: "chromeTabsDenied") }  // Automation denied: Settings says so
             return false
         }
+        if UserDefaults.standard.bool(forKey: "chromeTabsDenied") { UserDefaults.standard.set(false, forKey: "chromeTabsDenied") }
         return String(decoding: data, as: UTF8.self).components(separatedBy: ", ").contains { isMeet($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
 
@@ -165,6 +168,18 @@ final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
         content.categoryIdentifier = id
         if let started = model.started { content.userInfo = ["started": started.timeIntervalSinceReferenceDate] }
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { error in log("calls: posted \(id)\(error.map { ", failed: \($0.localizedDescription)" } ?? "")") }
+    }
+
+    /// Something that needs the owner while Kagu's windows are behind another app (a call in full screen):
+    /// a recording that stopped by itself, a warning, an error. In front, the notice in the window is enough.
+    static func alert(_ title: String, _ body: String) {
+        guard Bundle.main.bundleIdentifier != nil, !NSApp.isActive else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { error in log("notice posted: \(title)\(error.map { ", failed: \($0.localizedDescription)" } ?? "")") }
     }
 
     private func remove(_ ids: String...) {
