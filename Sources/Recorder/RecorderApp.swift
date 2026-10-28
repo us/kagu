@@ -25,6 +25,8 @@ struct RecorderApp: App {
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                     .disabled(delegate.model.state != .recording)
                 Divider()
+                Button("Import Audio...") { delegate.model.chooseAudio() }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
                 ImportCommand()
             }
             CommandGroup(replacing: .appInfo) {
@@ -67,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
         // Scripted runs: `--record <seconds>` presses record on launch, stops and quits after N seconds.
         let args = CommandLine.arguments
-        let scripted = ["--selftest", "--record", "--download", "--tag", "--play", "--transcribe-file", "--transcribe-raw"]
+        let scripted = ["--selftest", "--record", "--download", "--tag", "--play", "--transcribe-file", "--transcribe-raw", "--import-audio"]
         if !args.contains(where: scripted.contains) {
             calls.start()
             Updater.shared = Updater(model: model)
@@ -138,6 +140,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 player.seek(to: 5)
                 player.toggle()
                 print("duration \(player.duration) s, after 1.2 s at \(first) s, playing \(player.isPlaying), after seek \(player.time) s, paused \(!player.isPlaying)")
+                NSApp.terminate(nil)
+            }
+        }
+        // Scripted runs: `--import-audio <file>...` is Import Audio without the file picker; prints what the library then holds and quits.
+        if let i = args.firstIndex(of: "--import-audio"), i + 1 < args.count {
+            let files = args[(i + 1)...].prefix { !$0.hasPrefix("--") }.map { URL(fileURLWithPath: $0) }
+            Task { @MainActor [model] in
+                model.importAudio(files, into: model.folder)
+                try? await Task.sleep(for: .seconds(8))
+                model.library.reload()
+                try? await Task.sleep(for: .seconds(1))
+                for item in model.library.items { print("item \(item.url.lastPathComponent), \(Int(item.duration)) s, \(item.date)") }
+                print("message: \(model.message ?? "none")")
                 NSApp.terminate(nil)
             }
         }
@@ -401,6 +416,36 @@ final class Recorder {
         capture.paused.store(isPaused, ordering: .relaxed)
         log(isPaused ? "recording: paused at \(Int(elapsed)) s" : "recording: resumed")
         AccessibilityNotification.Announcement(isPaused ? "Paused" : "Recording").post()
+    }
+
+    /// File > Import Audio: picks audio files (from the phone) and brings them into the Recordings folder.
+    func chooseAudio() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = true
+        panel.message = "Choose audio files to add to the library. Each becomes a recording."
+        panel.prompt = "Import"
+        if panel.runModal() == .OK { importAudio(panel.urls, into: folder) }
+    }
+
+    func importAudio(_ urls: [URL], into directory: URL) {
+        Task {
+            var imported: [URL] = []
+            var failed: [String] = []
+            // A file already in the library (dragged in from Finder) stays one recording.
+            for url in urls where !url.standardizedFileURL.path.hasPrefix(folder.standardizedFileURL.path + "/") {
+                do { imported.append(try await Library.importAudio(url, into: directory)) } catch {
+                    failed.append(url.lastPathComponent)
+                    log("import failed for \(url.lastPathComponent): \(error)")
+                }
+            }
+            if let first = imported.first { lastFile = first }  // the list shows and selects it
+            if !failed.isEmpty {
+                fail("Could not import \(failed.formatted(.list(type: .and))). Kagu reads m4a, mp3, wav, aiff and caf audio.")
+            } else if imported.count > 1 {
+                notify("Imported \(imported.count) recordings.")
+            }
+        }
     }
 
     func showRecordingWindow() { if state != .idle { recordingWindow.show(model: self) } }

@@ -274,6 +274,7 @@ private struct GeneralSettings: View {
                 shortcut("Play or pause", "Space")
                 shortcut("Back or forward 15 seconds", "← →")
                 shortcut("Search", "⌘F")
+                shortcut("Import audio files", "⇧⌘I")
                 shortcut("Transcribe an audio file", "⇧⌘T")
             }
             .font(.callout)
