@@ -41,6 +41,7 @@ struct ContentView: View {
     @FocusState private var renameFocused: Bool
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.undoManager) private var undoManager
     // Where the window was left, to reopen there. App storage, not scene storage: with "Close windows when
     // quitting an application" on (the macOS default) a scene's storage does not survive a quit.
@@ -173,6 +174,7 @@ struct ContentView: View {
         }
         .onAppear {
             model.openMainWindow = { [openWindow] in openWindow(id: "main") }
+            if model.hideWindowAtLaunch { model.hideWindowAtLaunch = false; dismissWindow(id: "main") }
             library.undoManager = undoManager
             library.willTrash = { leave($0) }
             library.onPutBack = { item, problem in

@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -227,9 +228,27 @@ private struct GeneralSettings: View {
     @AppStorage("askToRecordCalls") private var askToRecordCalls = true
     @State private var notificationsOff = false
     @AppStorage("chromeTabsDenied") private var chromeTabsDenied = false
+    @State private var openAtLogin = LoginItem.isOn
+    @State private var loginNeedsApproval = LoginItem.needsApproval
     @State private var autoUpdate = Updater.shared?.updater?.automaticallyDownloadsUpdates ?? true
 
     var body: some View {
+        SettingRow(label: "Login") {
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Open Kagu at login", isOn: Binding(get: { openAtLogin }, set: { on in
+                    LoginItem.set(on)
+                    readLoginItem()
+                })).toggleStyle(.switch).tint(Theme.accent)
+                Text("Kagu starts without a window, ready to notice calls.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if loginNeedsApproval {
+                    Label { Text("Login Items in System Settings keeps Kagu from opening at login.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                        .font(.caption)
+                    Button("Open Login Items Settings") { SMAppService.openSystemSettingsLoginItems() }
+                        .controlSize(.small)
+                }
+            }
+        }
         SettingRow(label: "Menu bar") {
             Toggle("Show Kagu in the menu bar", isOn: $showMenuBar).toggleStyle(.switch).tint(Theme.accent)
         }
@@ -268,6 +287,7 @@ private struct GeneralSettings: View {
             notificationsOff = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
             for await _ in NotificationCenter.default.notifications(named: NSApplication.didBecomeActiveNotification) {
                 notificationsOff = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
+                readLoginItem()
             }
         }
         SettingRow(label: "Shortcuts") {
@@ -284,6 +304,11 @@ private struct GeneralSettings: View {
             }
             .font(.callout)
         }
+    }
+
+    private func readLoginItem() {
+        openAtLogin = LoginItem.isOn
+        loginNeedsApproval = LoginItem.needsApproval
     }
 
     private func shortcut(_ action: String, _ keys: String) -> some View {
