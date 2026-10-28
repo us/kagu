@@ -12,6 +12,8 @@ let package = Package(
             exclude: ["COPYING", "README.md"],
             cSettings: [.define("FLOATING_POINT"), .define("USE_KISS_FFT"), .define("EXPORT", to: "")]
         ),
-        .executableTarget(name: "Recorder", dependencies: ["CSpeexDSP", .product(name: "Sparkle", package: "Sparkle")], path: "Sources/Recorder"),
+        .target(name: "Calls", path: "Sources/Calls"),
+        .executableTarget(name: "Recorder", dependencies: ["CSpeexDSP", "Calls", .product(name: "Sparkle", package: "Sparkle")], path: "Sources/Recorder"),
+        .executableTarget(name: "KaguWatch", dependencies: ["Calls"], path: "Sources/KaguWatch"),
     ]
 )

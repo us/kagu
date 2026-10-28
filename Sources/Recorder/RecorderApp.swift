@@ -68,7 +68,7 @@ struct RecorderApp: App {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor let model = Recorder()
     @MainActor private lazy var calls = CallWatcher(model: model)
 
@@ -79,11 +79,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !args.contains(where: scripted.contains) {
             calls.start()
             Updater.shared = Updater(model: model)
+            let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.quitWhenFree() } }
+            RunLoop.main.add(timer, forMode: .common)
         }
-        if !args.dropFirst().contains(where: { $0.hasPrefix("--") }) { LoginItem.setUpOnce() }
-        // At login Kagu only watches for calls; the window waits for the Dock icon or the menu bar.
-        if LoginItem.launchedAtLogin, !applicationShouldTerminateAfterLastWindowClosed(NSApp) {
-            log("opened at login")
+        if !args.dropFirst().contains(where: { $0.hasPrefix("--") }) { Watch.setUp() }
+        // Opened by KaguWatch for a call: Kagu only asks to record it; the window waits for the Dock icon or the menu bar.
+        if Watch.openedForCall {
+            log("opened for a call")
             model.hideWindowAtLaunch = true  // a window SwiftUI makes later closes itself (ContentView)
             DispatchQueue.main.async { [model] in
                 for window in NSApp.windows where window.identifier?.rawValue.hasPrefix("main") == true {
@@ -91,7 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     model.hideWindowAtLaunch = false
                 }
             }
-            // ponytail: a window opened by hand in the first 10 s after login closes once; a launch-scene hook if that ever bites.
+            // ponytail: a window opened by hand in the first 10 s closes once; a launch-scene hook if that ever bites.
             DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [model] in model.hideWindowAtLaunch = false }
         }
         // Test aid: `--appearance light|dark` forces the look of the whole app.
@@ -199,11 +201,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// With the menu bar item on, calls watched (or a recording running) the app stays when its windows close.
-    @MainActor func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        let menuBar = UserDefaults.standard.object(forKey: "showMenuBar") as? Bool ?? true
-        let calls = UserDefaults.standard.object(forKey: "askToRecordCalls") as? Bool ?? true
-        return !menuBar && !calls && model.state == .idle
+    /// Seconds in a row Kagu had nothing to do.
+    @MainActor private var freeFor = 0
+
+    /// Kagu quits once it has had nothing to do for 30 s: no window open (or minimized, or hidden), nothing recording,
+    /// saving, recovering, importing, playing, transcribing or updating, no call in the last minute. KaguWatch opens it again for a call.
+    @MainActor private func quitWhenFree() {
+        let window = NSApp.isHidden || NSApp.modalWindow != nil || NSApp.windows.contains { ($0.isVisible || $0.isMiniaturized) && $0.canBecomeMain }
+        let busy = model.state != .idle || model.isRecovering || model.starting || model.messageIsBusy || model.player.isPlaying
+            || model.transcriber.isBusy || calls.isInCall || model.updating
+        freeFor = window || busy ? 0 : freeFor + 5
+        guard freeFor >= 30 else { return }
+        log("nothing to do, quitting")
+        NSApp.terminate(nil)
     }
 
     @MainActor func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -693,35 +703,51 @@ enum SaveRate {
     }
 }
 
-/// Kagu as a login item, so the call watch runs without opening Kagu by hand.
-enum LoginItem {
+/// KaguWatch, the small helper that opens Kagu when a call starts (a launch agent), so Kagu itself need not stay open.
+enum Watch {
+    static var service: SMAppService { .agent(plistName: "local.recorder.watch.plist") }
     /// Registered; macOS may still hold it back until it is allowed in Login Items (`needsApproval`).
-    static var isOn: Bool { [.enabled, .requiresApproval].contains(SMAppService.mainApp.status) }
-    static var needsApproval: Bool { SMAppService.mainApp.status == .requiresApproval }
+    static var isOn: Bool { [.enabled, .requiresApproval].contains(service.status) }
+    static var needsApproval: Bool { service.status == .requiresApproval }
+    /// This launch came from KaguWatch, for a call.
+    static let openedForCall = ProcessInfo.processInfo.environment["KAGU_CALL"] != nil
 
-    /// Turned on once, at the first plain launch of the copy in Applications; after that only the switch in Settings changes it.
-    static func setUpOnce() {
-        let path = Bundle.main.bundlePath
-        let installed = path.hasPrefix("/Applications/") || path.hasPrefix(FileManager.default.homeDirectoryForCurrentUser.path + "/Applications/")
-        guard installed, !UserDefaults.standard.bool(forKey: "openAtLoginSet") else { return }
-        if isOn || set(true) { UserDefaults.standard.set(true, forKey: "openAtLoginSet") }
-    }
-
-    @discardableResult
-    static func set(_ on: Bool) -> Bool {
-        do {
-            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            log("login item \(on ? "on" : "off"): \(SMAppService.mainApp.status.rawValue)")
-            return true
-        } catch {
-            log("login item \(on ? "on" : "off") failed: \(error.localizedDescription)")
-            return false
+    /// At a plain launch of the copy in Applications: the helper follows "Ask to record when a call starts",
+    /// and Kagu itself is no longer a login item (0.2.4 made it one).
+    static func setUp() {
+        guard installed else { return }
+        if SMAppService.mainApp.status != .notRegistered {
+            try? SMAppService.mainApp.unregister()
+            log("login item off: \(SMAppService.mainApp.status.rawValue)")
+        }
+        let calls = UserDefaults.standard.object(forKey: "askToRecordCalls") as? Bool ?? true
+        if calls != isOn { set(calls) }
+        // After an update the helper that runs is still the old one: launchd starts the new one in its place.
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        if calls, service.status == .enabled, UserDefaults.standard.string(forKey: "watchVersion") != version {
+            UserDefaults.standard.set(version, forKey: "watchVersion")
+            let restart = Process()
+            restart.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            restart.arguments = ["kickstart", "-k", "gui/\(getuid())/local.recorder.watch"]
+            try? restart.run()
+            log("call watch restarted for \(version ?? "?")")
         }
     }
 
-    /// The open event of a launch by the login window says so; read in applicationDidFinishLaunching.
-    static var launchedAtLogin: Bool {
-        guard let event = NSAppleEventManager.shared().currentAppleEvent, event.eventID == kAEOpenApplication else { return false }
-        return event.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+    /// Only the copy in Applications registers the helper: a build elsewhere would leave it pointing there.
+    private static var installed: Bool {
+        let path = Bundle.main.bundlePath
+        return path.hasPrefix("/Applications/") || path.hasPrefix(FileManager.default.homeDirectoryForCurrentUser.path + "/Applications/")
+    }
+
+    static func set(_ on: Bool) {
+        guard installed else { return }
+        if on { UserDefaults.standard.set(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String, forKey: "watchVersion") }
+        do {
+            if on { try service.register() } else { try service.unregister() }
+            log("call watch \(on ? "on" : "off"): \(service.status.rawValue)")
+        } catch {
+            log("call watch \(on ? "on" : "off") failed: \(error.localizedDescription)")
+        }
     }
 }
