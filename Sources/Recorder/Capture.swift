@@ -12,6 +12,14 @@ struct RecorderError: LocalizedError {
 /// Lines already in the log, counted once; the lock also keeps lines from two threads whole.
 private let logLines = Mutex<Int?>(nil)
 
+/// Free bytes on the volume holding `url`, read fresh: what macOS makes room for (purgeable space included), or the
+/// plain free space on a volume that does not say (disk images and some external drives answer 0). Nil when unreadable.
+func freeSpace(at url: URL) -> Int? {
+    let values = try? URL(fileURLWithPath: url.path).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+    if let important = values?.volumeAvailableCapacityForImportantUsage, important > 0 { return Int(important) }
+    return values?.volumeAvailableCapacity
+}
+
 /// Appends one line to `~/Library/Logs/Recorder.log` and returns its line number (the condition report under an error).
 @discardableResult
 func log(_ text: String) -> Int {
@@ -143,6 +151,17 @@ final class Capture: @unchecked Sendable {
     let paused = Atomic<Bool>(false)
     /// Frames that went into the file (gap fill included): the recording's real length, for the timer.
     let framesKept = Atomic<Int>(0)
+
+    /// About 500 MB set aside next to the file (`<file>.reserve`, real zeros) while recording. It is given back when
+    /// the disk fills (the recording goes on in it) and when saving starts (the save has room).
+    /// ponytail: best effort; a Time Machine snapshot taken meanwhile keeps its blocks until macOS purges them.
+    static let reserveBytes = 60 * (8 << 20)
+    /// Written in full and not given back yet. Set on the writer queue, read by the UI.
+    let reserveHeld = Atomic<Bool>(false)
+    private let stopping = Atomic<Bool>(false)
+    /// The reserve while it is being written (writer queue): a full disk in that second takes what is there.
+    private var reserveHandle: FileHandle?
+    private var reserveURL: URL { url.appendingPathExtension("reserve") }
 
     /// Called on the main queue when a watcher sees a change that makes the recording invalid.
     var onFault: (@MainActor (String) -> Void)?
@@ -284,6 +303,7 @@ final class Capture: @unchecked Sendable {
 
         status = AudioDeviceStart(aggregate, procID)
         guard status == noErr else { throw RecorderError("Could not start capture (\(status)).") }
+        writerQueue.async { [weak self] in self?.setAside() }  // after the start: a call must not wait for it
 
         let rate = sampleRate
         watch(aggregate, kAudioDevicePropertyNominalSampleRate) { [aggregate] in
@@ -414,10 +434,57 @@ final class Capture: @unchecked Sendable {
         }
     }
 
+    /// Writer queue only. Writes zeros in 8 MB steps, draining the ring between them so no audio waits.
+    private func setAside() {
+        guard FileManager.default.createFile(atPath: reserveURL.path, contents: nil), let handle = try? FileHandle(forWritingTo: reserveURL) else { return }
+        reserveHandle = handle
+        defer { reserveHandle = nil; try? handle.close() }
+        let chunk = Data(count: 8 << 20)
+        do {
+            for _ in 0..<(Self.reserveBytes / chunk.count) {
+                if stopping.load(ordering: .relaxed) || reserveHandle == nil { throw CancellationError() }
+                try handle.write(contentsOf: chunk)
+                drain()
+            }
+            try handle.synchronize()  // the blocks are really taken
+            reserveHeld.store(true, ordering: .relaxed)
+            log("reserve: set aside \(Self.reserveBytes / 1_000_000) MB")
+        } catch {
+            try? FileManager.default.removeItem(at: reserveURL)
+            if !(error is CancellationError) { log("reserve: could not set space aside: \(error)") }
+        }
+    }
+
+    /// Writer queue only. Frees the space set aside; false when there was none.
+    private func takeReserve() -> Bool {
+        if let handle = reserveHandle {  // still being written: what is there goes back now, and the writing stops
+            try? handle.truncate(atOffset: 0)
+            reserveHandle = nil
+            return true
+        }
+        guard reserveHeld.exchange(false, ordering: .relaxed) else { return false }
+        try? FileManager.default.removeItem(at: reserveURL)
+        return true
+    }
+
+    /// The disk watch: real free space ran out, the recording goes on in the space set aside.
+    func giveBackReserve() {
+        writerQueue.async { [weak self] in if self?.takeReserve() == true { log("reserve: given back, the disk is full") } }
+    }
+
+    /// Writer queue only. A write that fails on a full disk gets the space set aside and is tried once more.
+    private func put(_ buffer: AVAudioPCMBuffer) throws {
+        do { try file.write(from: buffer) } catch {
+            guard takeReserve() else { throw error }
+            log("reserve: given back after a failed write: \(error)")
+            try file.write(from: buffer)
+        }
+    }
+
     /// Writer queue only. Resamples to the file rate; nil flushes what the converter still holds (once, at the end).
     private func write(_ input: AVAudioPCMBuffer?) throws {
         guard let converter else {
-            if let input { try file.write(from: input); framesWritten += Int(input.frameLength) }
+            if let input { try put(input); framesWritten += Int(input.frameLength) }
             return
         }
         nonisolated(unsafe) var pending = input
@@ -435,7 +502,7 @@ final class Capture: @unchecked Sendable {
         }
         if status == .error { throw failure ?? RecorderError("Could not resample the audio.") }
         if fileBuffer.frameLength > 0 {
-            try file.write(from: fileBuffer)
+            try put(fileBuffer)
             framesWritten += Int(fileBuffer.frameLength)
         }
     }
@@ -444,7 +511,10 @@ final class Capture: @unchecked Sendable {
     func stop() -> Error? {
         teardown()
         timer?.cancel()
+        stopping.store(true, ordering: .relaxed)  // a reserve still being written stops at the next step
         writerQueue.sync {
+            _ = takeReserve()  // its room is for the save
+            try? FileManager.default.removeItem(at: reserveURL)  // one only partly written
             drain()
             if writeError == nil, converter != nil {
                 do { try write(nil) } catch { writeError = error; log("capture: write failed: \(error)") }

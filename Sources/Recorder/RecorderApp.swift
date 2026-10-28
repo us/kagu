@@ -271,49 +271,11 @@ final class Recorder {
         }
     }
 
-    /// Space set aside on the recordings disk while recording and let go when saving begins, so the save has room
-    /// even when another app fills the disk. Real zeros: a file that only claims its size holds nothing back.
-    /// ponytail: best effort; a Time Machine snapshot taken meanwhile keeps its blocks until macOS purges it, so the disk watch stays the guard.
-    nonisolated private static let reserveBytes = 60 * (8 << 20)  // about 500 MB, in whole chunks
-    private var reserveTask: Task<Void, Never>?
-    /// The reserve is written in full: only then does the disk watch count it.
-    private var reserveHeld = false
     /// What saving takes per second of audio: the m4a, the hidden tracks file and the two WAVs for a transcript.
     private static let savingBytesPerSecond = 90_000
 
-    private func setAside(while capture: Capture) {
-        let url = capture.url.appendingPathExtension("reserve")
-        reserveHeld = false
-        reserveTask = Task.detached(priority: .utility) {
-            let made = Self.writeZeros(url, bytes: Self.reserveBytes)
-            await MainActor.run {
-                // A short take may be saving already: then the space is not held back after all.
-                if self.capture !== capture || self.state != .recording { try? FileManager.default.removeItem(at: url); return }
-                self.reserveHeld = made
-                log(made ? "reserve: set aside \(Self.reserveBytes / 1_000_000) MB" : "reserve: could not set space aside")
-            }
-        }
-    }
-
-    nonisolated private static func writeZeros(_ url: URL, bytes: Int) -> Bool {
-        guard FileManager.default.createFile(atPath: url.path, contents: nil), let handle = try? FileHandle(forWritingTo: url) else { return false }
-        defer { try? handle.close() }
-        let chunk = Data(count: 8 << 20)
-        do {
-            for _ in 0..<(bytes / chunk.count) {
-                if Task.isCancelled { throw CancellationError() }  // saving began: the space goes back now, not after 500 MB
-                try handle.write(contentsOf: chunk)
-            }
-            try handle.synchronize()  // the blocks are really taken
-            return true
-        } catch {
-            try? FileManager.default.removeItem(at: url)
-            return false
-        }
-    }
-
     /// Free bytes on the recordings volume as `start()` counts them (space macOS can purge included), read fresh each time.
-    private var freeBytes: Int { (try? URL(fileURLWithPath: folder.path).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage).map(Int.init) ?? 1 << 50 }  // unknown: plenty, never Int.max (sums follow)
+    private var freeBytes: Int { freeSpace(at: folder) ?? 1 << 50 }  // unknown: plenty, never Int.max (sums follow)
 
     func toggle() {
         switch state {
@@ -337,7 +299,7 @@ final class Recorder {
         default:
             return fail(Self.micDenied, link: Self.micSettings)
         }
-        let free = (try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage) ?? 0
+        let free = freeSpace(at: folder) ?? 0
         guard free > 1 << 30 else { return fail("Not enough disk space. Free up at least 1 GB to record.") }
 
         let stamp = Date().formatted(.verbatim("\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits) \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)).\(minute: .twoDigits).\(second: .twoDigits)", timeZone: .current, calendar: .current))
@@ -364,7 +326,6 @@ final class Recorder {
             lowDisk = nil
             alerted = []
             state = .recording
-            setAside(while: capture)
             recordingWindow.show(model: self)
             AccessibilityNotification.Announcement("Recording started").post()
             log("recording: \(url.lastPathComponent)")
@@ -381,10 +342,6 @@ final class Recorder {
     func stop(reason: String? = nil) {
         guard state == .recording, let capture else { return }
         state = .saving
-        reserveTask?.cancel()
-        reserveTask = nil
-        reserveHeld = false
-        try? FileManager.default.removeItem(at: capture.url.appendingPathExtension("reserve"))  // its room is for the save
         let seconds = elapsed
         savingSince = Date()
         savingEstimate = SaveRate.estimate(for: seconds)
@@ -476,16 +433,20 @@ final class Recorder {
         lastFrames = frames
         if stalledTicks > 75 { return stop(reason: "Saved early: the audio stream stopped.") }  // 5 s
         // The raw file grows 6 bytes a frame (3 channels of 16 bit at the file rate). Saving needs `savingBytesPerSecond`
-        // for every second recorded, out of the free space plus the reserve; the file itself needs real free space.
-        // `-diskReserveMB <n>` takes that much more off, a test aid for this path.
+        // for every second recorded, out of the free space plus the space the capture set aside. When real free space
+        // runs out the capture gets that space back and goes on (it also does so by itself when a write fails);
+        // only when both no longer cover saving does it stop. `-diskReserveMB <n>` takes that much off, a test aid.
         if ticks % 15 == 0 {  // every second: another app can fill a disk fast
             let free = freeBytes - UserDefaults.standard.integer(forKey: "diskReserveMB") * 1_000_000
-            let room = free + (reserveHeld ? Self.reserveBytes : 0)
+            let held = capture.reserveHeld.load(ordering: .relaxed)
+            let room = free + (held ? Capture.reserveBytes : 0)
             let need = 100_000_000 + Int(elapsed) * Self.savingBytesPerSecond
-            if room < need || free < 50_000_000 { return stop(reason: "Saved early: the disk is almost full.") }
-            let raw = Int(Capture.fileRate) * 6
-            let seconds = min((room - need) / (raw + Self.savingBytesPerSecond), (free - 50_000_000) / raw)
-            lowDisk = seconds < 15 * 60 ? "The disk is almost full. Free up space, or Kagu saves and stops before it runs out." : nil
+            if room < need { return stop(reason: "Saved early: the disk is full.") }
+            if held, free < 100_000_000 { capture.giveBackReserve() }
+            let seconds = (room - need) / (Int(Capture.fileRate) * 6 + Self.savingBytesPerSecond)
+            lowDisk = seconds >= 15 * 60 ? nil : held
+                ? "The disk is almost full. Free up space, or Kagu saves and stops before it runs out."
+                : "The disk is full. Free up space now, or Kagu saves and stops soon."
         }
         // Without the system audio permission the tap delivers exact zeros while something plays.
         if !isPaused, ticks % 15 == 0, capture.outputIsPlayingElsewhere() { outputTicks += 15 }  // paused, nothing is heard on purpose

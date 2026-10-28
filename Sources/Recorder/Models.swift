@@ -97,7 +97,7 @@ final class ModelStore {
         guard state(model) == .missing else { return }
         message = nil
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let free = (try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage) ?? 0
+        let free = freeSpace(at: folder) ?? 0
         guard free > model.bytes + 1 << 30 else {
             message = "Not enough free disk space: \(model.sizeText) plus 1 GB are needed."
             return
