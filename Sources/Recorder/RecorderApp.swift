@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import ServiceManagement
 import SwiftUI
 
 @main
@@ -78,6 +79,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !args.contains(where: scripted.contains) {
             calls.start()
             Updater.shared = Updater(model: model)
+        }
+        if !args.dropFirst().contains(where: { $0.hasPrefix("--") }) { LoginItem.setUpOnce() }
+        // At login Kagu only watches for calls; the window waits for the Dock icon or the menu bar.
+        if LoginItem.launchedAtLogin, !applicationShouldTerminateAfterLastWindowClosed(NSApp) {
+            log("opened at login")
+            model.hideWindowAtLaunch = true  // a window SwiftUI makes later closes itself (ContentView)
+            DispatchQueue.main.async { [model] in
+                for window in NSApp.windows where window.identifier?.rawValue.hasPrefix("main") == true {
+                    window.close()
+                    model.hideWindowAtLaunch = false
+                }
+            }
+            // ponytail: a window opened by hand in the first 10 s after login closes once; a launch-scene hook if that ever bites.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [model] in model.hideWindowAtLaunch = false }
         }
         // Test aid: `--appearance light|dark` forces the look of the whole app.
         if let i = args.firstIndex(of: "--appearance"), i + 1 < args.count {
@@ -184,10 +199,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// With the menu bar item on (or a recording running) the app stays when its windows close.
+    /// With the menu bar item on, calls watched (or a recording running) the app stays when its windows close.
     @MainActor func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         let menuBar = UserDefaults.standard.object(forKey: "showMenuBar") as? Bool ?? true
-        return !menuBar && model.state == .idle
+        let calls = UserDefaults.standard.object(forKey: "askToRecordCalls") as? Bool ?? true
+        return !menuBar && !calls && model.state == .idle
     }
 
     @MainActor func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -221,6 +237,8 @@ final class Recorder {
     private(set) var levelHistory: [Float] = []
     /// Opens the library window from anywhere (set by a view that has `openWindow`).
     var openMainWindow: (() -> Void)?
+    /// Opened at login: the first library window closes as it appears.
+    var hideWindowAtLaunch = false
     private let recordingWindow = RecordingWindow()
     private(set) var micLevel: Float = 0
     private(set) var systemLevel: Float = 0
@@ -672,5 +690,38 @@ enum SaveRate {
         guard audio > 60 else { return }  // a short test take says little about an hour
         let rates = (UserDefaults.standard.array(forKey: key) as? [Double] ?? []) + [saving / audio]
         UserDefaults.standard.set(Array(rates.suffix(5)), forKey: key)
+    }
+}
+
+/// Kagu as a login item, so the call watch runs without opening Kagu by hand.
+enum LoginItem {
+    /// Registered; macOS may still hold it back until it is allowed in Login Items (`needsApproval`).
+    static var isOn: Bool { [.enabled, .requiresApproval].contains(SMAppService.mainApp.status) }
+    static var needsApproval: Bool { SMAppService.mainApp.status == .requiresApproval }
+
+    /// Turned on once, at the first plain launch of the copy in Applications; after that only the switch in Settings changes it.
+    static func setUpOnce() {
+        let path = Bundle.main.bundlePath
+        let installed = path.hasPrefix("/Applications/") || path.hasPrefix(FileManager.default.homeDirectoryForCurrentUser.path + "/Applications/")
+        guard installed, !UserDefaults.standard.bool(forKey: "openAtLoginSet") else { return }
+        if isOn || set(true) { UserDefaults.standard.set(true, forKey: "openAtLoginSet") }
+    }
+
+    @discardableResult
+    static func set(_ on: Bool) -> Bool {
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            log("login item \(on ? "on" : "off"): \(SMAppService.mainApp.status.rawValue)")
+            return true
+        } catch {
+            log("login item \(on ? "on" : "off") failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// The open event of a launch by the login window says so; read in applicationDidFinishLaunching.
+    static var launchedAtLogin: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent, event.eventID == kAEOpenApplication else { return false }
+        return event.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
     }
 }
