@@ -228,27 +228,10 @@ private struct GeneralSettings: View {
     @AppStorage("askToRecordCalls") private var askToRecordCalls = true
     @State private var notificationsOff = false
     @AppStorage("chromeTabsDenied") private var chromeTabsDenied = false
-    @State private var openAtLogin = LoginItem.isOn
-    @State private var loginNeedsApproval = LoginItem.needsApproval
+    @State private var watchNeedsApproval = Watch.needsApproval
     @State private var autoUpdate = Updater.shared?.updater?.automaticallyDownloadsUpdates ?? true
 
     var body: some View {
-        SettingRow(label: "Login") {
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle("Open Kagu at login", isOn: Binding(get: { openAtLogin }, set: { on in
-                    LoginItem.set(on)
-                    readLoginItem()
-                })).toggleStyle(.switch).tint(Theme.accent)
-                Text("Kagu starts without a window, ready to notice calls.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                if loginNeedsApproval {
-                    Label { Text("Login Items in System Settings keeps Kagu from opening at login.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
-                        .font(.caption)
-                    Button("Open Login Items Settings") { SMAppService.openSystemSettingsLoginItems() }
-                        .controlSize(.small)
-                }
-            }
-        }
         SettingRow(label: "Menu bar") {
             Toggle("Show Kagu in the menu bar", isOn: $showMenuBar).toggleStyle(.switch).tint(Theme.accent)
         }
@@ -264,8 +247,18 @@ private struct GeneralSettings: View {
         SettingRow(label: "Calls") {
             VStack(alignment: .leading, spacing: 4) {
                 Toggle("Ask to record when a call starts", isOn: $askToRecordCalls).toggleStyle(.switch).tint(Theme.accent)
-                Text("Zoom, Teams, Slack, Discord, FaceTime, WhatsApp, Webex, and Google Meet in Chrome. When the call ends, Kagu asks to stop and saves after 2 minutes.")
+                    .onChange(of: askToRecordCalls) { _, on in
+                        Watch.set(on)
+                        watchNeedsApproval = Watch.needsApproval
+                    }
+                Text("Zoom, Teams, Slack, Discord, FaceTime, WhatsApp, Webex, and Google Meet in Chrome. Kagu need not stay open: a small helper notices the call and opens it. When the call ends, Kagu asks to stop and saves after 2 minutes.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if askToRecordCalls, watchNeedsApproval {
+                    Label { Text("Kagu is turned off in Login Items, so it cannot notice calls while closed.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                        .font(.caption)
+                    Button("Open Login Items Settings") { SMAppService.openSystemSettingsLoginItems() }
+                        .controlSize(.small)
+                }
                 if askToRecordCalls, notificationsOff {
                     Label { Text("Notifications are off for Kagu, so it cannot ask.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
                         .font(.caption).foregroundStyle(.secondary)
@@ -287,7 +280,7 @@ private struct GeneralSettings: View {
             notificationsOff = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
             for await _ in NotificationCenter.default.notifications(named: NSApplication.didBecomeActiveNotification) {
                 notificationsOff = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
-                readLoginItem()
+                watchNeedsApproval = Watch.needsApproval
             }
         }
         SettingRow(label: "Shortcuts") {
@@ -304,11 +297,6 @@ private struct GeneralSettings: View {
             }
             .font(.callout)
         }
-    }
-
-    private func readLoginItem() {
-        openAtLogin = LoginItem.isOn
-        loginNeedsApproval = LoginItem.needsApproval
     }
 
     private func shortcut(_ action: String, _ keys: String) -> some View {

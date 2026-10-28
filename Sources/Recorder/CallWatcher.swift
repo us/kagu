@@ -1,24 +1,22 @@
 import AppKit
+import Calls
 import UserNotifications
 
 /// Notices a call (a call app, or Chrome on a Google Meet tab, holding a mic) and asks to record it.
 /// When the call ends during a recording it asks to stop, and stops and saves by itself 2 minutes later.
 @MainActor
 final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
-    /// Call apps by bundle id prefix; their helpers report ids that start the same.
-    nonisolated static let apps: [(prefix: String, name: String)] = [
-        ("us.zoom", "Zoom"), ("com.microsoft.teams", "Teams"), ("com.tinyspeck.slackmacgap", "Slack"), ("com.hnc.Discord", "Discord"),
-        ("com.apple.FaceTime", "FaceTime"), ("net.whatsapp.WhatsApp", "WhatsApp"), ("Cisco-Systems.Spark", "Webex"), ("com.webex.meetingmanager", "Webex"),
-    ]
-    nonisolated static func callApp(_ bundle: String) -> String? { apps.first { bundle.hasPrefix($0.prefix) }?.name }
-    /// Chrome and its helpers, not Canary or a web app Chrome made (those have ids of their own).
-    nonisolated static func isChrome(_ bundle: String) -> Bool { bundle == "com.google.Chrome" || bundle.hasPrefix("com.google.Chrome.helper") }
+    nonisolated static func callApp(_ bundle: String) -> String? { Calls.callApp(bundle) }
+    nonisolated static func isChrome(_ bundle: String) -> Bool { Calls.isChrome(bundle) }
     nonisolated static func isMeet(_ url: String) -> Bool { url.range(of: #"^https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(?![a-z])"#, options: .regularExpression) != nil }
 
     private unowned let model: Recorder
     private var timer: Timer?
     /// The app of the call going on: set once an app held a mic for 4 s, cleared after 10 s without.
     private var call: String?
+    /// A call app holds a mic (or Kagu is asking Chrome about Meet), a call is on, or one ended under a minute ago
+    /// (one back by then is the same call, see `endedAt`): Kagu stays open meanwhile.
+    var isInCall: Bool { seenSince != nil || askingChrome || call != nil || endedAt.map { Date().timeIntervalSince($0) < 60 } == true }
     private var seenSince: Date?
     private var goneSince: Date?
     /// When the last call ended: one back within a minute (a mute, a dropped line) is the same call, not asked again.
