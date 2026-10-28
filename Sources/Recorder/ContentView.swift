@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// What the middle column shows: everything, one folder (nil is the Recordings folder itself) or one tag.
 enum Scope: Hashable {
@@ -305,6 +306,13 @@ struct ContentView: View {
                 .focusEffectDisabled()
                 .onMoveCommand { direction in moveSelection(direction, ids: sections.flatMap { $0.items.map(\.id) }, proxy: proxy) }
                 .onDeleteCommand { if let item = selectedItem, shown.contains(where: { $0.id == item.id }) { trash(item) } }
+                // Audio files from Finder (a phone recording) land in the folder on screen.
+                .dropDestination(for: URL.self) { urls, _ in
+                    let audio = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .audio) == true }
+                    guard !audio.isEmpty else { return false }
+                    if case .folder(let name?) = scope { model.importAudio(audio, into: library.directory(name)) } else { model.importAudio(audio, into: library.folder) }
+                    return true
+                }
                 .overlay {
                     if shown.isEmpty, !search.isEmpty {
                         ContentUnavailableView.search(text: search)

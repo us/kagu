@@ -171,6 +171,36 @@ final class Library {
                 stem.appendingPathExtension("raw.caf"), stem.appendingPathExtension("mic-clean.caf"), sidecarURL(for: m4a)]
     }
 
+    /// Brings an audio file (a phone recording) into `directory` as an m4a, keeping its name and date; another
+    /// format is converted. It is then a recording like any other, with one track (no You and Them).
+    nonisolated static func importAudio(_ source: URL, into directory: URL) async throws -> URL {
+        let stem = cleanName(source.deletingPathExtension().lastPathComponent)
+        var target = directory.appending(path: stem.isEmpty ? "Imported" : stem).appendingPathExtension("m4a")
+        var n = 2
+        while parts(of: target).contains(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+            target = directory.appending(path: "\(stem.isEmpty ? "Imported" : stem) \(n)").appendingPathExtension("m4a")
+            n += 1
+        }
+        let created = try? source.resourceValues(forKeys: [.creationDateKey]).creationDate
+        // Written under a hidden name and moved into place whole, so the list never shows half a file.
+        let temporary = directory.appending(path: ".import-\(UUID().uuidString).m4a")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        if source.pathExtension.lowercased() == "m4a" {
+            try FileManager.default.copyItem(at: source, to: temporary)
+            Register.clear(temporary)  // a number from another Kagu library is not one of this register's
+            guard ((try? AVAudioFile(forReading: temporary).length) ?? 0) > 0 else { throw RecorderError("\(source.lastPathComponent) has no audio.") }
+        } else {
+            guard let export = AVAssetExportSession(asset: AVURLAsset(url: source), presetName: AVAssetExportPresetAppleM4A) else {
+                throw RecorderError("Kagu cannot read \(source.lastPathComponent).")
+            }
+            try await export.export(to: temporary, as: .m4a)
+        }
+        // The day it was recorded, not the day it was brought in: the list sorts by it.
+        if let created { try? FileManager.default.setAttributes([.creationDate: created], ofItemAtPath: temporary.path) }
+        try FileManager.default.moveItem(at: temporary, to: target)
+        return target
+    }
+
     /// A name for a file or a folder: no slash or colon, no leading dot, no ending of a recording's parts.
     nonisolated static func cleanName(_ name: String) -> String {
         var clean = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-").trimmingCharacters(in: .whitespacesAndNewlines)
