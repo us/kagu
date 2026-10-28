@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/us/kagu/compare/v0.2.2...v0.2.3) (2026-10-28)
+
+
+### Features
+
+* playback speed, follow along, undo trash and a menu bar timer ([bc18e7b](https://github.com/us/kagu/commit/bc18e7b41071ea0ab045e7b42ce0dc1b6b82bd3a))
+
 ## [0.2.2](https://github.com/us/kagu/compare/v0.2.1...v0.2.2) (2026-10-28)
 
 
