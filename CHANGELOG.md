@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.2](https://github.com/us/kagu/compare/v0.2.1...v0.2.2) (2026-10-28)
+
+
+### Features
+
+* import audio files (from the phone) into the library ([d641f5d](https://github.com/us/kagu/commit/d641f5d54998a56b016b63481af5bc6bc6bf8fb2))
+* record raw audio at 16 kHz and set disk space aside while recording ([bf18b96](https://github.com/us/kagu/commit/bf18b96e908efa62af10cdf0b2f83192785675e9))
+* save recordings as mono 16 kHz audio, about half the size ([b485c96](https://github.com/us/kagu/commit/b485c9687a5e20ee3575fd499e5f250dbafaee6c))
+
+
+### Bug Fixes
+
+* keep recording when the disk fills, in the space set aside ([9e2c063](https://github.com/us/kagu/commit/9e2c0633baf18b8398ac89d2f948e4f9c19dc312))
+* save before the disk fills and notify when a recording stops ([8445a8f](https://github.com/us/kagu/commit/8445a8fb062d187e45fa2bfb334434f646b0bf66))
+
 ## [0.2.1](https://github.com/us/kagu/compare/v0.2.0...v0.2.1) (2026-10-27)
 
 
