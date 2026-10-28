@@ -299,8 +299,12 @@ final class Transcriber {
         waiters.forEach { $0() }
     }
 
+    /// Another recording's transcript is being made, so this one waits its turn.
+    func isBusyElsewhere(_ source: URL) -> Bool { current.map { $0.job.source != source } ?? false }
+
     private func fail(_ source: URL, _ text: String) {
         states[source] = .failed(text)
+        AccessibilityNotification.Announcement("Transcript failed: \(text)").post()
         log("transcript failed for \(source.lastPathComponent): \(text)")
         checkIdle()
     }

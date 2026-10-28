@@ -46,6 +46,8 @@ final class Player {
         time = player.currentTime
     }
 
+    func skip(_ seconds: Double) { seek(to: (player?.currentTime ?? 0) + seconds) }
+
     func stop() {
         player?.stop()
         player?.currentTime = 0

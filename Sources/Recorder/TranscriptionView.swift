@@ -224,6 +224,7 @@ private struct GeneralSettings: View {
     @AppStorage("showMenuBar") private var showMenuBar = true
     @AppStorage("askToRecordCalls") private var askToRecordCalls = true
     @State private var notificationsOff = false
+    @AppStorage("chromeTabsDenied") private var chromeTabsDenied = false
     @State private var autoUpdate = Updater.shared?.updater?.automaticallyDownloadsUpdates ?? true
 
     var body: some View {
@@ -251,6 +252,11 @@ private struct GeneralSettings: View {
                     }
                     .controlSize(.small)
                 }
+                if askToRecordCalls, chromeTabsDenied {
+                    Text("Kagu is not allowed to see Chrome tabs, so it cannot notice Google Meet.").font(.caption).foregroundStyle(.orange)
+                    Button("Open Automation Settings") { open("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") }
+                        .controlSize(.small)
+                }
             }
         }
         .task {
@@ -266,6 +272,7 @@ private struct GeneralSettings: View {
                 shortcut("Stop recording", "⌘.")
                 shortcut("Pause or resume", "⇧⌘P")
                 shortcut("Play or pause", "Space")
+                shortcut("Back or forward 15 seconds", "← →")
                 shortcut("Search", "⌘F")
                 shortcut("Transcribe an audio file", "⇧⌘T")
             }
@@ -337,7 +344,7 @@ private struct PrivacySettings: View {
         SettingRow(label: "") {
             Button("Open Privacy Settings...") { open("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") }.controlSize(.small)
         }
-        Note(text: "Recordings, transcripts and the speech model stay on this Mac. Kagu sends no recording or transcript anywhere; the only download is the speech model, when you ask for it.", icon: "lock")
+        Note(text: "Recordings, transcripts and the speech model stay on this Mac. Kagu sends no recording or transcript anywhere; it downloads only the speech model, when you ask for it, and its own updates.", icon: "lock")
             .onAppear { mic = AVCaptureDevice.authorizationStatus(for: .audio) }
     }
 
