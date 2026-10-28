@@ -124,7 +124,7 @@ func threeChannelFormat(sampleRate: Double) -> AVAudioFormat {
 
 // MARK: - Capture
 
-/// Records the mic plus everything the Mac plays into a 3 channel CAF (mic, system L, system R).
+/// Records the mic plus everything the Mac plays into a 3 channel CAF (mic, system L, system R) at 16 kHz, the rate Whisper reads.
 /// One private aggregate device holds the mic (clock) and a global unmuted tap, so both sides
 /// arrive in the same IO callback and stay sample aligned.
 final class Capture: @unchecked Sendable {
@@ -148,8 +148,13 @@ final class Capture: @unchecked Sendable {
     var onFault: (@MainActor (String) -> Void)?
 
     private let ring: Ring
+    /// The rate of the file: the device runs at its own rate (48 kHz mostly) and the writer resamples.
+    static let fileRate = 16_000.0
+
     private let file: AVAudioFile
     private let writeBuffer: AVAudioPCMBuffer
+    private let converter: AVAudioConverter?
+    private let fileBuffer: AVAudioPCMBuffer
     private let writerQueue = DispatchQueue(label: "recorder.writer", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private var writeError: Error?
@@ -210,7 +215,7 @@ final class Capture: @unchecked Sendable {
         let micStreams: Int, micFormat: AudioStreamBasicDescription, tapFormat: AudioStreamBasicDescription
         do {
             sampleRate = try get(aggregateID, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, Float64(0))
-            // ponytail: the AAC encoder rejects rates above 48 kHz; resample in Convert if a 96 kHz interface ever matters
+            // ponytail: rates above 48 kHz are refused; the writer could resample them too if a 96 kHz interface ever matters
             guard sampleRate <= 48000 else {
                 throw RecorderError("\(micName) runs at \(Int(sampleRate)) Hz. Set it to 48000 Hz in Audio MIDI Setup and try again.")
             }
@@ -236,7 +241,8 @@ final class Capture: @unchecked Sendable {
             log("capture: mic \(micName) \(micChannels) ch in \(micStreams) streams, rate \(sampleRate), tap \(tapFormat.mSampleRate) Hz")
 
             let format = threeChannelFormat(sampleRate: sampleRate)
-            var settings = format.settings
+            let fileFormat = threeChannelFormat(sampleRate: Self.fileRate)
+            var settings = fileFormat.settings
             settings[AVFormatIDKey] = kAudioFormatLinearPCM
             settings[AVLinearPCMBitDepthKey] = 16
             settings[AVLinearPCMIsFloatKey] = false
@@ -244,6 +250,8 @@ final class Capture: @unchecked Sendable {
             settings[AVLinearPCMIsNonInterleaved] = false
             file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: true)
             writeBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(sampleRate))!
+            converter = sampleRate == Self.fileRate ? nil : AVAudioConverter(from: format, to: fileFormat)
+            fileBuffer = AVAudioPCMBuffer(pcmFormat: fileFormat, frameCapacity: AVAudioFrameCount(Self.fileRate) + 4096)!  // one ring read, one second at most
             ring = Ring(channels: 3, capacity: Int(sampleRate) * 10)
         } catch {
             AudioHardwareDestroyAggregateDevice(aggregateID)
@@ -396,8 +404,7 @@ final class Capture: @unchecked Sendable {
             }
             writeBuffer.frameLength = AVAudioFrameCount(n)
             do {
-                try file.write(from: writeBuffer)
-                framesWritten += n
+                try write(writeBuffer)
             } catch {
                 writeError = error
                 fault.store(4, ordering: .relaxed)
@@ -407,12 +414,43 @@ final class Capture: @unchecked Sendable {
         }
     }
 
+    /// Writer queue only. Resamples to the file rate; nil flushes what the converter still holds (once, at the end).
+    private func write(_ input: AVAudioPCMBuffer?) throws {
+        guard let converter else {
+            if let input { try file.write(from: input); framesWritten += Int(input.frameLength) }
+            return
+        }
+        nonisolated(unsafe) var pending = input
+        let atEnd = input == nil
+        var failure: NSError?
+        fileBuffer.frameLength = 0
+        let status = converter.convert(to: fileBuffer, error: &failure) { _, status in
+            if let buffer = pending {
+                pending = nil
+                status.pointee = .haveData
+                return buffer
+            }
+            status.pointee = atEnd ? .endOfStream : .noDataNow
+            return nil
+        }
+        if status == .error { throw failure ?? RecorderError("Could not resample the audio.") }
+        if fileBuffer.frameLength > 0 {
+            try file.write(from: fileBuffer)
+            framesWritten += Int(fileBuffer.frameLength)
+        }
+    }
+
     /// Stops capture and flushes everything to disk. Returns a write error if one happened.
     func stop() -> Error? {
         teardown()
         timer?.cancel()
-        writerQueue.sync { drain() }
-        writerQueue.sync { file.close() }
+        writerQueue.sync {
+            drain()
+            if writeError == nil, converter != nil {
+                do { try write(nil) } catch { writeError = error; log("capture: write failed: \(error)") }
+            }
+            file.close()
+        }
         log("capture: stopped, \(framesWritten) frames, \(gaps.load(ordering: .relaxed)) gaps, fault \(fault.load(ordering: .relaxed))")
         return writeError
     }

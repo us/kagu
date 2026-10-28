@@ -235,13 +235,22 @@ final class Recorder {
     /// For the warning about missing system audio permission: how long something played, and the loudest Mac sample so far.
     private var outputTicks = 0
     private var systemPeakEver: Float = 0
-    /// Set every 5 s while recording when the disk has under 15 minutes of room left.
+    /// Set every second while recording when the disk has under 15 minutes of room left.
     private var lowDisk: String?
     /// Warnings already sent as a notification during this recording: each once, however often it comes and goes.
     private var alerted: Set<String> = []
 
     init() {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // Reserves left by a crash; one whose recording is still written belongs to another copy of the app
+        // (a crashed take younger than 10 s keeps its reserve until recovery converts it).
+        let reserves = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []).filter { $0.pathExtension == "reserve" }
+        if !reserves.isEmpty {
+            let leftovers = Set(Convert.leftovers(in: folder))
+            for file in reserves where !FileManager.default.fileExists(atPath: file.deletingPathExtension().path) || leftovers.contains(file.deletingPathExtension()) {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
         library = Library(folder: folder)
         transcriber.shouldPause = { [unowned self] in self.state != .idle || self.isRecovering }
         library.onMove = { [transcriber] in transcriber.moved($0, to: $1) }
@@ -262,8 +271,49 @@ final class Recorder {
         }
     }
 
+    /// Space set aside on the recordings disk while recording and let go when saving begins, so the save has room
+    /// even when another app fills the disk. Real zeros: a file that only claims its size holds nothing back.
+    /// ponytail: best effort; a Time Machine snapshot taken meanwhile keeps its blocks until macOS purges it, so the disk watch stays the guard.
+    nonisolated private static let reserveBytes = 60 * (8 << 20)  // about 500 MB, in whole chunks
+    private var reserveTask: Task<Void, Never>?
+    /// The reserve is written in full: only then does the disk watch count it.
+    private var reserveHeld = false
+    /// What saving takes per second of audio: the m4a, the hidden tracks file and the two WAVs for a transcript.
+    private static let savingBytesPerSecond = 90_000
+
+    private func setAside(while capture: Capture) {
+        let url = capture.url.appendingPathExtension("reserve")
+        reserveHeld = false
+        reserveTask = Task.detached(priority: .utility) {
+            let made = Self.writeZeros(url, bytes: Self.reserveBytes)
+            await MainActor.run {
+                // A short take may be saving already: then the space is not held back after all.
+                if self.capture !== capture || self.state != .recording { try? FileManager.default.removeItem(at: url); return }
+                self.reserveHeld = made
+                log(made ? "reserve: set aside \(Self.reserveBytes / 1_000_000) MB" : "reserve: could not set space aside")
+            }
+        }
+    }
+
+    nonisolated private static func writeZeros(_ url: URL, bytes: Int) -> Bool {
+        guard FileManager.default.createFile(atPath: url.path, contents: nil), let handle = try? FileHandle(forWritingTo: url) else { return false }
+        defer { try? handle.close() }
+        let chunk = Data(count: 8 << 20)
+        do {
+            for _ in 0..<(bytes / chunk.count) {
+                if Task.isCancelled { throw CancellationError() }  // saving began: the space goes back now, not after 500 MB
+                try handle.write(contentsOf: chunk)
+            }
+            try handle.synchronize()  // the blocks are really taken
+            return true
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            return false
+        }
+    }
+
     /// Free bytes on the recordings volume as `start()` counts them (space macOS can purge included), read fresh each time.
-    private var freeBytes: Int { (try? URL(fileURLWithPath: folder.path).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage).map(Int.init) ?? .max }
+    private var freeBytes: Int { (try? URL(fileURLWithPath: folder.path).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage).map(Int.init) ?? 1 << 50 }  // unknown: plenty, never Int.max (sums follow)
 
     func toggle() {
         switch state {
@@ -314,6 +364,7 @@ final class Recorder {
             lowDisk = nil
             alerted = []
             state = .recording
+            setAside(while: capture)
             recordingWindow.show(model: self)
             AccessibilityNotification.Announcement("Recording started").post()
             log("recording: \(url.lastPathComponent)")
@@ -330,6 +381,10 @@ final class Recorder {
     func stop(reason: String? = nil) {
         guard state == .recording, let capture else { return }
         state = .saving
+        reserveTask?.cancel()
+        reserveTask = nil
+        reserveHeld = false
+        try? FileManager.default.removeItem(at: capture.url.appendingPathExtension("reserve"))  // its room is for the save
         let seconds = elapsed
         savingSince = Date()
         savingEstimate = SaveRate.estimate(for: seconds)
@@ -420,14 +475,17 @@ final class Recorder {
         stalledTicks = !isPaused && frames == lastFrames ? stalledTicks + 1 : 0
         lastFrames = frames
         if stalledTicks > 75 { return stop(reason: "Saved early: the audio stream stopped.") }  // 5 s
-        // The raw file grows 6 bytes a frame (3 channels of 16 bit); saving then needs room for the m4a and its tracks
-        // (about 25 KB a second together). `-diskReserveMB <n>` raises the floor, a test aid for this path.
-        if ticks % 75 == 0 {
-            let floor = 300_000_000 + Int(elapsed) * 30_000 + UserDefaults.standard.integer(forKey: "diskReserveMB") * 1_000_000
-            let free = freeBytes
-            if free < floor { return stop(reason: "Saved early: the disk is almost full.") }
-            let minutes = (free - floor) / Int(capture.sampleRate * 6 * 60)
-            lowDisk = minutes < 15 ? "The disk is almost full. Free up space, or Kagu saves and stops before it runs out." : nil
+        // The raw file grows 6 bytes a frame (3 channels of 16 bit at the file rate). Saving needs `savingBytesPerSecond`
+        // for every second recorded, out of the free space plus the reserve; the file itself needs real free space.
+        // `-diskReserveMB <n>` takes that much more off, a test aid for this path.
+        if ticks % 15 == 0 {  // every second: another app can fill a disk fast
+            let free = freeBytes - UserDefaults.standard.integer(forKey: "diskReserveMB") * 1_000_000
+            let room = free + (reserveHeld ? Self.reserveBytes : 0)
+            let need = 100_000_000 + Int(elapsed) * Self.savingBytesPerSecond
+            if room < need || free < 50_000_000 { return stop(reason: "Saved early: the disk is almost full.") }
+            let raw = Int(Capture.fileRate) * 6
+            let seconds = min((room - need) / (raw + Self.savingBytesPerSecond), (free - 50_000_000) / raw)
+            lowDisk = seconds < 15 * 60 ? "The disk is almost full. Free up space, or Kagu saves and stops before it runs out." : nil
         }
         // Without the system audio permission the tap delivers exact zeros while something plays.
         if !isPaused, ticks % 15 == 0, capture.outputIsPlayingElsewhere() { outputTicks += 15 }  // paused, nothing is heard on purpose
@@ -515,6 +573,7 @@ final class Recorder {
                     continue
                 }
                 let retry = tries > 0
+                try? FileManager.default.removeItem(at: caf.appendingPathExtension("reserve"))  // the crashed take's reserve: room for this
                 try? "\(tries + 1)".write(to: marker, atomically: true, encoding: .utf8)
                 do {
                     let tracksFolder = Tracks.folder(stamp: m4a.deletingPathExtension().lastPathComponent)
