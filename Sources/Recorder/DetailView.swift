@@ -137,7 +137,7 @@ struct DetailView: View {
             Button("Transcribe Again") { transcribeAgain() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("A new transcript is made with the model chosen in Settings. The current one goes to the Trash once the new one is ready.")
+            Text("A new transcript is made with the model chosen in Settings. The current one, with its summary, names and replacements, goes to the Trash once the new one is ready.")
         }
         .onChange(of: request, initial: true) { _, request in
             guard let request, request.url == item.url else { return }
@@ -322,6 +322,7 @@ struct DetailView: View {
     @ViewBuilder private var transcript: some View {
         if !blocks.isEmpty {
             LazyVStack(alignment: .leading, spacing: 18) {
+                if query.isEmpty { SummaryView(item: item, blocks: blocks, summaries: transcriber.summaries) }
                 ForEach(shownBlocks, id: \.offset) { offset, block in
                     HStack(alignment: .firstTextBaseline, spacing: 0) {
                         Button(duration(block.seconds)) { play(from: block) }
@@ -515,7 +516,7 @@ struct DetailView: View {
 
     private func copy() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(Transcript.plainText(title: item.displayTitle, date: item.date, blocks: blocks), forType: .string)
+        NSPasteboard.general.setString(Transcript.plainText(title: item.displayTitle, date: item.date, summary: Summary.plainText(in: item.transcriptText), blocks: blocks), forType: .string)
         copied = true
         Task {
             try? await Task.sleep(for: .seconds(1.5))
@@ -543,7 +544,7 @@ struct DetailView: View {
         do {
             switch kind {
             case .transcriptMarkdown: try item.transcriptText.write(to: target, atomically: true, encoding: .utf8)
-            case .transcriptText: try Transcript.plainText(title: item.displayTitle, date: item.date, blocks: blocks).write(to: target, atomically: true, encoding: .utf8)
+            case .transcriptText: try Transcript.plainText(title: item.displayTitle, date: item.date, summary: Summary.plainText(in: item.transcriptText), blocks: blocks).write(to: target, atomically: true, encoding: .utf8)
             case .audio:
                 // Exporting onto the recording itself would delete it before the copy: nothing to do then.
                 guard target.standardizedFileURL.resolvingSymlinksInPath() != item.url.standardizedFileURL.resolvingSymlinksInPath() else { return }

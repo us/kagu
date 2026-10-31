@@ -39,6 +39,8 @@ final class Transcriber {
     static let languages = ["auto", "en", "tr", "de", "es", "fr", "it", "pt", "nl", "ru", "ar", "ja", "zh"]
 
     let models = ModelStore()
+    /// The summaries made after a transcript; its work counts as busy, so a quit waits for it.
+    let summaries = Summarizer()
     /// One entry per recording or file in progress. A finished job leaves nothing: its transcript file is the result.
     private(set) var states: [URL: State] = [:]
     /// Transcripts of files that are not in the library (File menu): where they went.
@@ -75,12 +77,14 @@ final class Transcriber {
         language = defaults.string(forKey: "whisperLanguage") ?? "auto"
         // One model on disk and another one selected: use the one that is there.
         if models.state(model) != .installed, let installed = WhisperModel.allCases.first(where: { models.state($0) == .installed }) { model = installed }
+        summaries.shouldPause = { [weak self] in self?.shouldPause() ?? false }
+        summaries.onIdle = { [weak self] in self?.checkIdle() }
     }
 
     /// True when a finished recording should go straight into a transcript.
     var wantsTracks: Bool { enabled && models.state(model) == .installed && Whisper.binary != nil }
 
-    var isBusy: Bool { working || !queue.isEmpty || states.values.contains { !$0.isFailure } }
+    var isBusy: Bool { working || !queue.isEmpty || states.values.contains { !$0.isFailure } || summaries.isBusy }
 
     // MARK: - Asking for a transcript
 
@@ -154,6 +158,7 @@ final class Transcriber {
         if replacing.remove(old) != nil { replacing.insert(new) }
         for i in queue.indices where queue[i].source == old { queue[i] = queue[i].following(new) }
         if let job = current?.job, job.source == old { current?.job = job.following(new) }
+        summaries.moved(old, to: new)
         // The tracks of a recording's own job are found again at the next launch by its name (see `resumeInterrupted`).
         for job in queue + [current?.job].compactMap({ $0 }) where job.source == new && !job.cleanup.lastPathComponent.hasPrefix("job-") {
             try? new.path.write(to: job.cleanup.appending(path: Self.nameFile), atomically: true, encoding: .utf8)
@@ -291,6 +296,7 @@ final class Transcriber {
         shuttingDown = true
         queue.removeAll()
         current?.process.cancel()
+        summaries.shutDown()
     }
 
     /// Runs `action` once nothing is being prepared, queued or run.
@@ -382,6 +388,7 @@ final class Transcriber {
             states[now.source] = nil
             if !now.source.path.hasPrefix(Library.defaultFolder.path + "/") { finishedElsewhere[now.source] = output }
             log("transcript: \(output.lastPathComponent), \(lines.count) paragraphs")
+            if now.tracks.count == 2, !lines.isEmpty { summaries.request(now.source) }  // a recording of Kagu's own: You and Them are known
             AccessibilityNotification.Announcement("Transcript ready").post()
         } catch is CancellationError {
             // Quitting keeps the tracks of a recording for the next launch; a cancel, or a one-off file, leaves nothing behind.

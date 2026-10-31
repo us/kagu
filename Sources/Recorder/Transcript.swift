@@ -160,10 +160,10 @@ enum Transcript {
         return blocks.filter { !$0.text.isEmpty }
     }
 
-    /// What the Copy button puts on the clipboard: a title, then each passage as speaker, time and text.
-    static func plainText(title: String, date: Date, blocks: [Block]) -> String {
+    /// What the Copy button puts on the clipboard: a title, the summary if there is one, then each passage as speaker, time and text.
+    static func plainText(title: String, date: Date, summary: String? = nil, blocks: [Block]) -> String {
         let head = "\(title)\n\(date.formatted(date: .long, time: .shortened))"
-        return ([head] + blocks.map { "\($0.speaker) (\(clock($0.seconds)))\n\($0.text)" }).joined(separator: "\n\n")
+        return ([head] + (summary.map { [$0] } ?? []) + blocks.map { "\($0.speaker) (\(clock($0.seconds)))\n\($0.text)" }).joined(separator: "\n\n")
     }
 
     static func clock(_ seconds: Double) -> String {
