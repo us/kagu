@@ -177,6 +177,7 @@ struct ContentView: View {
             if model.hideWindowAtLaunch { model.hideWindowAtLaunch = false; dismissWindow(id: "main") }
             library.undoManager = undoManager
             library.willTrash = { leave($0) }
+            library.onRetitle = { old, new in if selection == old { selection = new } }
             library.onPutBack = { item, problem in
                 if let problem { model.show(problem) }
                 guard let item else { return }

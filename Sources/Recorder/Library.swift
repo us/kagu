@@ -363,6 +363,35 @@ final class Library {
         return url
     }
 
+    /// Told after a recording was renamed by Kagu itself (a title from its summary, and the undo of it): the list moves its selection.
+    @ObservationIgnored var onRetitle: ((_ old: URL, _ new: URL) -> Void)?
+
+    /// Gives a recording that still has its default name a title of Kagu's making. It is looked up by where it is now:
+    /// nil, and nothing renamed, when it is not in the library, has a name somebody chose, or is on its way to the Trash.
+    func retitle(_ url: URL, to title: String) -> URL? {
+        guard let item = items.first(where: { $0.url.standardizedFileURL == url.standardizedFileURL }), item.hasDefaultName else { return nil }
+        return renameWithUndo(item, to: title)
+    }
+
+    /// A rename with one undo step, "Rename", that puts the old name back while the recording is still at the new one and the old name is free.
+    private func renameWithUndo(_ item: RecordingItem, to name: String) -> URL? {
+        guard !trashing.contains(item.url) else { return nil }
+        guard let new = rename(item, to: name) else { return nil }
+        onRetitle?(item.url, new)
+        guard let undoManager else { return new }
+        let old = item.url
+        // Its own group, so the menu reads "Undo Rename"; inside an undo or a redo the step is the other direction of it.
+        let grouped = !undoManager.isUndoing && !undoManager.isRedoing
+        if grouped { undoManager.beginUndoGrouping() }
+        undoManager.registerUndo(withTarget: self) { library in
+            guard let current = library.items.first(where: { $0.url == new }), !Self.parts(of: old).contains(where: Self.isFile) else { return }
+            _ = library.renameWithUndo(current, to: item.stem)
+        }
+        undoManager.setActionName("Rename")
+        if grouped { undoManager.endUndoGrouping() }
+        return new
+    }
+
     /// The window's undo manager: a trash is registered there, so Edit > Undo puts the recording back.
     @ObservationIgnored weak var undoManager: UndoManager?
     /// Told after Undo Move to Trash: the recording when its audio is back, and why a part could not come back.

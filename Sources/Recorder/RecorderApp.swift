@@ -272,6 +272,8 @@ final class Recorder {
 
     let transcriber = Transcriber()
     let player = Player()
+    /// The recording whose title field is open in the detail pane: Kagu does not rename it by itself meanwhile.
+    @ObservationIgnored var editingTitle: URL?
     let folder = Library.defaultFolder
     let library: Library
     private let keepRaw = CommandLine.arguments.contains("--keep-raw")
@@ -311,7 +313,8 @@ final class Recorder {
         }
         library = Library(folder: folder)
         transcriber.shouldPause = { [unowned self] in self.state != .idle || self.isRecovering }
-        library.onMove = { [transcriber] in transcriber.moved($0, to: $1) }
+        library.onMove = { [transcriber, player] in transcriber.moved($0, to: $1); player.moved($0, to: $1) }
+        transcriber.summaries.onWritten = { [unowned self] source, parts in await retitle(source, from: parts) }
         transcriber.resumeInterrupted(recordings: folder)
         recoverLeftovers()
         // A file that changed in the last seconds is skipped above (it may still be written); look again once it settled.
@@ -451,6 +454,25 @@ final class Recorder {
     private func finishTracks(m4a: URL, tracks: URL?) {
         guard let tracks else { return }
         if transcriber.wantsTracks { transcriber.enqueueRecording(m4a: m4a, tracks: tracks) } else { try? FileManager.default.removeItem(at: tracks) }
+    }
+
+    /// A recording that still has Kagu's default name gets a title from its summary, so nobody renames every meeting by hand.
+    /// Looked up again by where the recording is after the model pass: a name chosen meanwhile, or a transcript made again, wins.
+    private func retitle(_ source: URL, from parts: Summary.Parts) async {
+        func isDefault(_ url: URL) -> Bool { library.items.first { $0.url.standardizedFileURL == url.standardizedFileURL }?.hasDefaultName == true }
+        guard isDefault(source), let title = await Summary.title(for: parts) else { return }
+        let now = transcriber.summaries.running ?? source  // renamed during the pass?
+        guard transcriber.states[now] == nil, editingTitle?.standardizedFileURL != now.standardizedFileURL else { return }
+        guard let new = library.retitle(now, to: title) else {
+            if let problem = library.moveProblem {
+                library.moveProblem = nil
+                show(problem)
+            }
+            return
+        }
+        log("title: \(now.deletingPathExtension().lastPathComponent) -> \(new.deletingPathExtension().lastPathComponent)")
+        // With no window open nothing follows the selection: the next launch must not look for the old name.
+        if UserDefaults.standard.string(forKey: "lastSelection") == now.path { UserDefaults.standard.set(new.path, forKey: "lastSelection") }
     }
 
     func dismissMessage() {
