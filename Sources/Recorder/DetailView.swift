@@ -331,10 +331,19 @@ struct DetailView: View {
                             .frame(width: 58, alignment: .leading)
                             .help("Play from here")
                             .accessibilityLabel("Play from \(spoken(block.seconds))")
-                        Text(block.speaker)
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(block.speaker == "You" ? Theme.you : Color.primary)
+                        if Transcript.isOwner(block.speaker) {
+                            Text(block.speaker)
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(Theme.you)
+                                .frame(width: 70, alignment: .leading)
+                        } else {
+                            SpeakerLabel(
+                                speaker: block.speaker, busy: replaceBusy,
+                                problem: { Transcript.speakerNameProblem($0, replacing: block.speaker, in: item.transcriptText) },
+                                rename: { renameSpeaker(block.speaker, to: $0) }
+                            )
                             .frame(width: 70, alignment: .leading)
+                        }
                         Text(highlighted(block.text))
                             .font(Theme.body)
                             .lineSpacing(4)
@@ -471,6 +480,19 @@ struct DetailView: View {
         query = ""
         model.library.reload()
         AccessibilityNotification.Announcement("Replaced \(count) \(count == 1 ? "match" : "matches")").post()
+    }
+
+    /// Renames the other speaker in the transcript file, with the same guards and undo as Replace All.
+    private func renameSpeaker(_ old: String, to name: String) {
+        guard let url = item.transcript, !replaceBusy else { return }
+        do {
+            let wrote = try TranscriptFile.edit(url, expected: item.transcriptText, undo: model.library.undoManager, action: "Rename Speaker") { Transcript.renaming(old, to: name, in: $0) }
+            guard wrote != nil else { return }
+        } catch {
+            return model.show("Could not rename: \(error.localizedDescription)")
+        }
+        model.library.reload()
+        AccessibilityNotification.Announcement("\(old) is now \(Transcript.cleanSpeakerName(name))").post()
     }
 
     private func play(from block: Transcript.Block) {
@@ -859,6 +881,70 @@ private struct TagEditor: View {
         .padding(12)
         .onAppear { focused = true }
         .task {
+            try? await Task.sleep(for: .milliseconds(150))
+            focused = true
+        }
+    }
+}
+
+/// The other speaker's name in the transcript: a click opens a field to rename it for this recording.
+private struct SpeakerLabel: View {
+    let speaker: String
+    let busy: Bool
+    let problem: (String) -> String?
+    let rename: (String) -> Void
+    @State private var editing = false
+    @State private var draft = ""
+
+    var body: some View {
+        Button { open() } label: { Text(speaker).font(.callout.weight(.semibold)).lineLimit(1).truncationMode(.tail) }
+            .buttonStyle(.plain)
+            .disabled(busy)
+            .help(busy ? "Not while this recording is being transcribed" : "\(speaker): Rename Speaker...")
+            .accessibilityHint("Rename speaker")
+            .contextMenu { Button("Rename Speaker...") { open() }.disabled(busy) }
+            .popover(isPresented: $editing, arrowEdge: .bottom) {
+                SpeakerEditor(draft: $draft, current: speaker, problem: problem) { name in
+                    editing = false
+                    rename(name)
+                }
+            }
+    }
+
+    private func open() {
+        draft = speaker
+        editing = true
+    }
+}
+
+/// The popover's own view, so its text field owns its focus. The reason a name is refused shows as it is typed.
+private struct SpeakerEditor: View {
+    @Binding var draft: String
+    let current: String
+    let problem: (String) -> String?
+    let done: (String) -> Void
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        let name = Transcript.cleanSpeakerName(draft)
+        let issue = name == current ? nil : problem(name)
+        let ready = name != current && issue == nil
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Rename Speaker").font(.callout.weight(.semibold))
+            TextField("Name", text: $draft).textFieldStyle(.roundedBorder).focused($focused).onSubmit { if ready { done(name) } }
+            Text(issue ?? "For a call with one other person. Copy and exports use the name too.")
+                .font(.footnote)
+                .foregroundStyle(issue == nil ? .secondary : Theme.accent)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Rename") { done(name) }.disabled(!ready)
+            }
+        }
+        .frame(width: 230)
+        .padding(12)
+        .task {
+            // Delayed: a focus set while the popover is still opening is lost.
             try? await Task.sleep(for: .milliseconds(150))
             focused = true
         }
