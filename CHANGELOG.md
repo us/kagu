@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.6](https://github.com/us/kagu/compare/v0.2.5...v0.2.6) (2026-10-31)
+
+
+### Features
+
+* give a default-named recording a title from its summary ([e3d8ba0](https://github.com/us/kagu/commit/e3d8ba0a029b0aac64f69862892bbb49025a15e3))
+* name the other speaker in a transcript ([0cd3fff](https://github.com/us/kagu/commit/0cd3fff9dbd4a5b4e49bd8eddabce1f310d411e5))
+* replace a misheard word everywhere in a transcript ([84f1374](https://github.com/us/kagu/commit/84f1374320cfd1fdfb048e5044acf638865bb1be))
+* summary, decisions and action items made on this Mac ([2045de6](https://github.com/us/kagu/commit/2045de6a742c39571291d1346ec23ca71c8a6986))
+
+
+### Bug Fixes
+
+* build the summary with the macOS 26 SDK too ([729dc3f](https://github.com/us/kagu/commit/729dc3f0cbe4770885195a1dad12717bfbf2c575))
+* split a time stamp sum that timed out the type checker on CI ([291fb7a](https://github.com/us/kagu/commit/291fb7a26d08131eca2e920e3f7e4fe63e002c2b))
+
 ## [0.2.5](https://github.com/us/kagu/compare/v0.2.4...v0.2.5) (2026-10-28)
 
 
