@@ -28,6 +28,8 @@ struct DetailView: View {
     @State private var tab = CommandLine.arguments.contains("--details") ? Tab.details : .transcript  // `--details` is a test aid
     @State private var query = ""
     @State private var confirmReplace = false
+    @State private var replacing = false  // the Replace row under the tabs is open
+    @State private var replacement = ""
     @State private var editingTitle = false
     @State private var addingTag = false
     @State private var following = true  // the paragraph playing is kept in view until the user scrolls away
@@ -35,6 +37,7 @@ struct DetailView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var titleFocused: Bool
     @FocusState private var queryFocused: Bool
+    @FocusState private var replacementFocused: Bool
 
     /// The library search: its words are marked in the transcript, and the first line with them is scrolled to.
     let hint: String
@@ -61,7 +64,7 @@ struct DetailView: View {
 
     /// Case and accents ignored, as the highlight: "gorusme" finds "görüşme".
     private static func contains(_ text: String, _ term: String) -> Bool {
-        text.range(of: term, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        text.range(of: term, options: Transcript.findOptions) != nil
     }
 
     var body: some View {
@@ -70,6 +73,7 @@ struct DetailView: View {
                 header
                 PlayerBar(player: player, peaks: peaks)
                 tabs
+                if tab == .transcript, replacing, !blocks.isEmpty { replaceRow }
                 if tab == .transcript, item.transcript != nil, transcriber.states[item.url] != nil {
                     // Transcribed again: progress, Cancel or the failure stay in view; the old transcript stays until the new one is in.
                     TranscribeControl(item: item, transcriber: transcriber)
@@ -93,7 +97,7 @@ struct DetailView: View {
                 .task(id: hint) {
                     try? await Task.sleep(for: .milliseconds(300))  // after typing settles, and after the lines are laid out
                     guard !Task.isCancelled, !hint.isEmpty, query.isEmpty,
-                          let first = blocks.firstIndex(where: { $0.text.range(of: hint, options: [.caseInsensitive, .diacriticInsensitive]) != nil }) else { return }
+                          let first = blocks.firstIndex(where: { $0.text.range(of: hint, options: Transcript.findOptions) != nil }) else { return }
                     proxy.scrollTo(first, anchor: .top)
                 }
                 // Clearing the search keeps the place: the first paragraph that matched stays in view.
@@ -283,6 +287,15 @@ struct DetailView: View {
                             .accessibilityLabel(matchCount)
                     }
                     SearchField(prompt: "Search transcript...", text: $query, focus: $queryFocused).frame(minWidth: 140, maxWidth: 260)
+                    Button {
+                        replacing.toggle()
+                        Task { @MainActor in replacementFocused = replacing }  // after the row is in the window
+                    } label: { Image(systemName: "arrow.left.arrow.right") }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(replacing ? Theme.accent : .secondary)
+                        .help("Find and Replace")
+                        .accessibilityLabel("Find and Replace")
+                        .accessibilityAddTraits(replacing ? .isSelected : [])
                 }
             }
         }
@@ -365,13 +378,52 @@ struct DetailView: View {
     /// "3 of 41 paragraphs": how many the transcript search leaves on view.
     private var matchCount: String { "\(shownBlocks.count) of \(blocks.count) \(blocks.count == 1 ? "paragraph" : "paragraphs")" }
 
+    /// How many times the search term is in the passages, as Replace All will count them.
+    private var occurrences: Int { query.isEmpty ? 0 : Transcript.replacing(query, with: "", in: item.transcriptText).count }
+
+    /// A new transcript is being made for this recording: the one on screen is about to go, so it is not edited.
+    private var replaceBusy: Bool { transcriber.states[item.url].map { !$0.isFailure } ?? false }
+
+    /// "Replace with" and its button, under the tabs, right where the search field is above them.
+    private var replaceRow: some View {
+        let matches = occurrences
+        let busy = replaceBusy
+        return HStack(spacing: 8) {
+            Spacer(minLength: 12)
+            if !query.isEmpty {
+                ViewThatFits { Text("\(matches) \(matches == 1 ? "match" : "matches") in \(shownBlocks.count) \(shownBlocks.count == 1 ? "paragraph" : "paragraphs")"); Text("\(matches) \(matches == 1 ? "match" : "matches")") }
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            TextField("Replace with...", text: $replacement)
+                .textFieldStyle(.plain)
+                .font(.callout)
+                .focused($replacementFocused)
+                .onSubmit { replaceAll() }  // Return replaces, as in Xcode's replace field
+                .onExitCommand {
+                    replacing = false
+                    queryFocused = true
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.card))
+                .frame(minWidth: 140, maxWidth: 260)
+            Button("Replace All") { replaceAll() }
+                .help(busy ? "Not while this recording is being transcribed" : "Replace every match")
+                .buttonStyle(QuietButtonStyle())
+                .disabled(busy || matches == 0)
+                .opacity(busy || matches == 0 ? 0.45 : 1)  // the button style does not dim by itself
+        }
+    }
+
     /// The search words get a soft red mark.
     private func highlighted(_ text: String) -> AttributedString {
         var result = AttributedString(text)
         let mark = query.isEmpty ? hint : query
         guard !mark.isEmpty else { return result }
         var searchFrom = result.startIndex
-        while let range = result[searchFrom...].range(of: mark, options: [.caseInsensitive, .diacriticInsensitive]) {
+        while let range = result[searchFrom...].range(of: mark, options: Transcript.findOptions) {
             result[range].backgroundColor = Theme.accent.opacity(0.22)
             searchFrom = range.upperBound
         }
@@ -398,6 +450,27 @@ struct DetailView: View {
             return title = item.displayTitle
         }
         onRename(item.url, url)
+    }
+
+    /// Replace All, written into the transcript file. `expected` is the text on screen: a
+    /// transcript that changed meanwhile is not overwritten. The library reloads at once, so the screen follows the write.
+    private func replaceAll() {
+        guard let url = item.transcript, !query.isEmpty, !replaceBusy else { return }
+        var count = 0
+        do {
+            try TranscriptFile.edit(url, expected: item.transcriptText, undo: model.library.undoManager, action: "Replace All") { text in
+                let result = Transcript.replacing(query, with: replacement, in: text)
+                count = result.count
+                return result.text
+            }
+        } catch {
+            return model.show("Could not replace: \(error.localizedDescription)")
+        }
+        guard count > 0 else { return }
+        // The search is cleared: the paragraphs that changed come back into view, and the button is off until the reload is in.
+        query = ""
+        model.library.reload()
+        AccessibilityNotification.Announcement("Replaced \(count) \(count == 1 ? "match" : "matches")").post()
     }
 
     private func play(from block: Transcript.Block) {

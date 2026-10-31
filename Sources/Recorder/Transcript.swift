@@ -133,7 +133,7 @@ enum Transcript {
 
     /// The rule before the note: the last `---` with no passage after it. A `---` someone typed between
     /// passages is part of the text, not the foot.
-    private static func foot(_ lines: [Substring]) -> Int? {
+    static func foot(_ lines: [Substring]) -> Int? {
         guard let index = lines.lastIndex(of: Substring(rule)), !lines[(index + 1)...].contains(where: { $0.wholeMatch(of: /\*\*(.+?)\*\* `(\d+):(\d+):(\d+)`/) != nil }) else { return nil }
         return index
     }

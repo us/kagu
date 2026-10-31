@@ -35,6 +35,7 @@ enum Selftest {
         defer { try? fm.removeItem(at: root) }
 
         failures += TranscriptFile.selfTest(in: root)
+        failures += Transcript.replaceSelfTest()
 
         // Download verification
         let probe = root.appending(path: "probe")
