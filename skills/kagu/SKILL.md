@@ -34,6 +34,28 @@ The first line is the title (the file name), then how and when it was transcribe
 
 The speakers are **You** (the mic) and **Them** (the Mac's sound); a transcript of an imported file may have one speaker, **Speaker**. The owner can rename a speaker other than You in Kagu for that recording (for example **Fran**); then every block of that speaker carries the name the owner gave it. Older transcripts may say **Me** for You.
 
+A transcript of a recording Kagu made, or one the owner asked a summary for, has a block between the header line and the first turn, and may have a note at the very end:
+
+```markdown
+## Summary
+
+You and the other side agreed to ship on Friday.
+
+## Decisions
+
+- Ship on Friday
+
+## Action items
+
+- You: send the contract to Fran
+
+Made on this Mac from the transcript; it can be wrong.
+```
+
+- The summary, decisions and action items are made on the Mac by a small on-device model. They are machine-made and can be wrong or incomplete: treat them as a guide to where to look, not as a record. Decisions and Action items are left out when there are none; a transcript may have no summary at all.
+- A quote must come from the speaker lines (`**You** ...`, `**Them** ...`), never from the summary. Quote with the speaker and the time stamp of the turn.
+- At the very end, after a line with `---`, a note such as "Struck from the record: 41 fillers ..." says what the cleaning removed from the transcript.
+
 ## Common tasks
 
 - Latest recordings: `ls -t ~/Music/Recordings/**/*.m4a | head` (zsh), or `find ~/Music/Recordings -name '*.m4a' -not -name '.*' -print0 | xargs -0 ls -t | head`.
