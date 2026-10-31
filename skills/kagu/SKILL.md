@@ -32,6 +32,8 @@ Yes, Friday works.
 
 The first line is the title (the file name), then how and when it was transcribed, then one block per turn: speaker, start time (hours:minutes:seconds from the start of the recording), text.
 
+The speakers are **You** (the mic) and **Them** (the Mac's sound); a transcript of an imported file may have one speaker, **Speaker**. The owner can rename a speaker other than You in Kagu for that recording (for example **Fran**); then every block of that speaker carries the name the owner gave it. Older transcripts may say **Me** for You.
+
 ## Common tasks
 
 - Latest recordings: `ls -t ~/Music/Recordings/**/*.m4a | head` (zsh), or `find ~/Music/Recordings -name '*.m4a' -not -name '.*' -print0 | xargs -0 ls -t | head`.

@@ -36,6 +36,7 @@ enum Selftest {
 
         failures += TranscriptFile.selfTest(in: root)
         failures += Transcript.replaceSelfTest()
+        failures += Transcript.speakerSelfTest()
 
         // Download verification
         let probe = root.appending(path: "probe")
