@@ -360,7 +360,7 @@ private enum Model {
             if await abandon() { throw CancellationError() }  // a recording started
             // A new session for each pass: a pass never carries the one before it in its window.
             let session = LanguageModelSession(model: model, instructions: Summary.instructions(language: language, other: other))
-            let reply = try await session.respond(to: Summary.prompt(text, notes: notes, final: final, language: language, other: other), options: GenerationOptions(samplingMode: .greedy, maximumResponseTokens: final ? 700 : 500))
+            let reply = try await session.respond(to: Summary.prompt(text, notes: notes, final: final, language: language, other: other), options: GenerationOptions(sampling: .greedy, maximumResponseTokens: final ? 700 : 500))
             done += 1
             await progress(Double(done) / Double(total))
             return reply.content
@@ -406,7 +406,9 @@ private enum Model {
     }
 
     private static func isOverflow(_ error: Error) -> Bool {
+        #if compiler(>=6.4)  // the macOS 27 SDK; CI builds with the macOS 26 one, which has only GenerationError
         if #available(macOS 27, *), case .contextSizeExceeded? = error as? LanguageModelError { return true }
+        #endif
         if case .exceededContextWindowSize? = error as? LanguageModelSession.GenerationError { return true }
         return false
     }
