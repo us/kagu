@@ -152,7 +152,9 @@ struct DetailView: View {
             player.load(item.url)
             peaks = await Waveform.peaks(url: item.url, count: 130)
         }
+        .onChange(of: editingTitle) { _, editing in model.editingTitle = editing ? item.url : nil }
         .onDisappear {
+            if model.editingTitle == item.url { model.editingTitle = nil }
             // Another row was clicked while the title was being edited: keep the new name.
             if title.normalizedSpaces != item.displayTitle.normalizedSpaces, FileManager.default.fileExists(atPath: item.url.path) { commitTitle() }
             player.unload(item.url)

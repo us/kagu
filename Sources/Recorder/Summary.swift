@@ -187,6 +187,60 @@ enum Summary {
         return task.wholeMatch(of: /(?:(?:to|will|is|are|be|keep|keeps|continue|continues)\s+)*(?:testing\s+)?(?:the\s+)?(?:record|transcrib)\w*(?:\s+and\s+(?:record|transcrib)\w*)?(?:\s+(?:this|the|our|that)\s+(?:meeting|call|conversation|session|discussion|talk|interview)|\s+(?:it|everything))?\s*[.!]?/) != nil
     }
 
+    // MARK: - A title from the summary
+
+    /// A short title for a recording that still has its default name; nil when the model has none or does not speak the language.
+    static func title(for parts: Parts) async -> String? {
+        #if canImport(FoundationModels)
+        if #available(macOS 26, *) { return await Model.title(summary: parts.summary) }
+        #endif
+        return nil
+    }
+
+    static func titleInstructions(language: String) -> String {
+        "You name recorded conversations. Write in \(language). Use only what the text says; never invent names or numbers."
+    }
+
+    static func titlePrompt(_ summary: String, language: String) -> String {
+        """
+        Below is the summary of a conversation. Write a title for it: 2 to 6 words in \(language) that name the main subject the speakers worked on or decided, not small talk. \
+        Do not use the words meeting, call, summary, discussion or conversation (or their translations). No date, no quotes, no colon and no full stop.
+        Answer with the title alone.
+
+        \(summary)
+        """
+    }
+
+    /// Words that name no topic: a title made only of them is not kept.
+    private static let genericWords: Set<String> = ["meeting", "meetings", "summary", "call", "calls", "discussion", "conversation", "notes", "recording", "talk", "chat",
+        "overview", "recap", "minutes", "team", "weekly", "sync", "update", "updates", "standup", "haftalik", "ekip", "the", "a", "an", "of", "and", "on", "about", "for", "with", "ve", "ile", "bir", "bu", "not", "notlari", "kayit"]
+    /// Turkish roots that take endings (toplantısı, özeti, görüşmesi).
+    private static let genericRoots = ["toplanti", "ozet", "gorusme", "konusma", "sohbet"]
+
+    private static func fold(_ word: String) -> String {
+        word.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).replacingOccurrences(of: "ı", with: "i")
+    }
+
+    static func isGeneric(_ title: String) -> Bool {
+        title.split(whereSeparator: { !$0.isLetter }).allSatisfy { word in
+            let word = fold(String(word))
+            return genericWords.contains(word) || genericRoots.contains { word.hasPrefix($0) }
+        }
+    }
+
+    /// The model's answer as a file name, or nil to keep the old name: empty, generic, with a date, or over 60 characters.
+    static func cleanTitle(_ output: String) -> String? {
+        guard let line = output.split(separator: "\n").map({ plain(String($0)) }).first(where: { !$0.isEmpty }) else { return nil }
+        let marks = CharacterSet(charactersIn: "\"'`“”„‘’«»*_ ")
+        // "Title: x", "Here is a title: x"; a colon left inside the title is a dash, as a file name cannot hold one.
+        var title = line.replacing(/(?i)^.*?\b(title|başlık)\b[^:]*:\s*/, with: "").replacingOccurrences(of: ":", with: " -")
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ").trimmingCharacters(in: marks)
+        title = Library.cleanName(title.trimmingCharacters(in: CharacterSet(charactersIn: ".:;,!?-\u{2013}\u{2014}\u{2026} ").union(marks)))
+        guard !title.isEmpty, title.count <= 60, !isGeneric(title),
+              title.firstMatch(of: /\d{4}-\d{2}-\d{2}|\d{1,2}[.\/]\d{1,2}[.\/]\d{2,4}/) == nil else { return nil }
+        return title
+    }
+
     // MARK: - The block in the transcript file
 
     private static var speakerLine: Regex<(Substring, Substring, Substring, Substring, Substring)> { /\*\*(.+?)\*\* `(\d+):(\d+):(\d+)`/ }
@@ -236,6 +290,80 @@ enum Summary {
         guard let parts = parts(in: markdown) else { return nil }
         func list(_ heading: String, _ items: [String]) -> [String] { items.isEmpty ? [] : ["", heading] + items.map { "- " + $0 } }
         return (["Summary", parts.summary] + list("Decisions", parts.decisions) + list("Action items", parts.actions) + ["", disclaimer]).joined(separator: "\n")
+    }
+
+    // MARK: - Self check of the title (run with --selftest)
+
+    @MainActor
+    static func titleSelfTest(in root: URL) async -> [String] {
+        var failures: [String] = []
+        func expect(_ ok: Bool, _ what: String) { if !ok { failures.append(what) } }
+        func item(_ stem: String) -> RecordingItem {
+            RecordingItem(url: URL(fileURLWithPath: "/r/\(stem).m4a"), date: .now, duration: 0, transcript: nil, transcriptText: "", tags: [])
+        }
+
+        for stem in ["Recording 2026-10-30 17.15.18", "Recording 2026-10-30 17.15.18 2", "Recording 2026-10-30 17.15.18 12"] { expect(item(stem).hasDefaultName, "default name: \(stem)") }
+        for stem in ["meet-fri-30", "Standup", "Recording 2026-10-30", "My Recording 2026-10-30 17.15.18", "Recording 2026-10-30 17.15.18 final",
+                     "Toplantı Özeti", "Fiyatlandırma Toplantısı", "Recording 2026-10-30 17.15.18.5"] { expect(!item(stem).hasDefaultName, "not a default name: \(stem)") }
+
+        let good: [(String, String)] = [("Pricing Page Launch", "Pricing Page Launch"), ("\"Pricing Page Launch.\"", "Pricing Page Launch"), ("Title: Pricing launch\nMore text", "Pricing launch"),
+                                        ("**Rinor Lansman Planı**", "Rinor Lansman Planı"), ("Fiyatlandırma Toplantısı", "Fiyatlandırma Toplantısı"), ("# Q3 / Q4 budget", "Q3 - Q4 budget"),
+                                        ("“Fran ile sözleşme”", "Fran ile sözleşme"), ("\n\nBaşlık: Teknik borç", "Teknik borç"), ("Budget: next year", "Budget - next year"), ("Here is a title: Pricing launch", "Pricing launch"), ("İşte başlık: Teknik borç", "Teknik borç"), ("Pricing launch", "Pricing launch")]
+        for (raw, want) in good { expect(cleanTitle(raw) == want, "title \(raw.debugDescription): \(cleanTitle(raw) ?? "nil")") }
+        for raw in ["", "   ", "\"\"", "Meeting", "Meeting Summary", "Team Meeting", "Weekly sync", "Haftalık Ekip Toplantısı", "Standup update", "Call summary.", "Discussion of the meeting", "Toplantı", "TOPLANTI", "Toplantı Özeti", "Görüşme Notları", "Özeti",
+                    "Team sync 2026-10-30", "Review 30.10.2026", String(repeating: "word ", count: 13)] {
+            expect(cleanTitle(raw) == nil, "rejected title \(raw.debugDescription): \(cleanTitle(raw) ?? "nil")")
+        }
+        expect(cleanTitle(String(repeating: "a", count: 60)) != nil && cleanTitle(String(repeating: "a", count: 61)) == nil, "60 characters is the limit")
+
+        // A rename by Kagu: every part moves, the list is told, one undo puts the names back, redo again; a name somebody chose is left alone.
+        let fm = FileManager.default
+        let folder = root.appending(path: "Titles")
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        func touch(_ name: String) { fm.createFile(atPath: folder.appending(path: name).path, contents: Data("x".utf8)) }
+        func has(_ name: String) -> Bool { fm.fileExists(atPath: folder.appending(path: name).path) }
+        let old = "Recording 2026-10-30 17.15.18"
+        for name in ["\(old).m4a", "\(old).md", ".\(old).tracks.m4a", "meet-fri-30.m4a", "meet-fri-30.md"] { touch(name) }
+        let library = Library(folder: folder)
+        // The library reads its folder in the background and again after each change (the file events come about half a second
+        // later): wait until it has loaded, then a little more so a late scan cannot overwrite the next step.
+        func settle() async {
+            for _ in 0..<50 where !library.loaded { try? await Task.sleep(for: .milliseconds(100)) }
+            try? await Task.sleep(for: .milliseconds(900))
+        }
+        await settle()
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        library.undoManager = undo
+        var told: [(String, String)] = []
+        library.onRetitle = { told.append(($0.lastPathComponent, $1.lastPathComponent)) }
+        let source = folder.appending(path: "\(old).m4a")
+        expect(library.retitle(folder.appending(path: "meet-fri-30.m4a"), to: "Other") == nil && has("meet-fri-30.m4a") && undo.canUndo == false, "a name somebody chose is not renamed")
+        expect(library.retitle(folder.appending(path: "gone.m4a"), to: "Other") == nil, "a file that is not in the library is not renamed")
+        let new = library.retitle(source, to: "Pricing Page Launch")
+        expect(new?.lastPathComponent == "Pricing Page Launch.m4a" && has("Pricing Page Launch.m4a") && has("Pricing Page Launch.md") && has(".Pricing Page Launch.tracks.m4a"), "retitle moves every part")
+        expect(!has("\(old).m4a") && !has("\(old).md") && !has(".\(old).tracks.m4a"), "retitle leaves nothing behind")
+        expect(told.count == 1 && told[0] == ("\(old).m4a", "Pricing Page Launch.m4a"), "the list is told: \(told)")
+        expect(undo.undoActionName == "Rename", "one undo step named Rename: \(undo.undoActionName)")
+        expect(library.retitle(folder.appending(path: "Pricing Page Launch.m4a"), to: "Again") == nil, "a titled recording is not renamed again")
+        await settle()
+        undo.undo()
+        expect(has("\(old).m4a") && has("\(old).md") && has(".\(old).tracks.m4a") && !has("Pricing Page Launch.m4a") && !has("Pricing Page Launch.md"), "undo puts every old name back")
+        expect(told.last.map { $0 == ("Pricing Page Launch.m4a", "\(old).m4a") } == true, "the list is told about the undo: \(told)")
+        await settle()
+        undo.redo()
+        expect(has("Pricing Page Launch.m4a") && has("Pricing Page Launch.md") && !has("\(old).m4a"), "redo gives the title again")
+        // An undo is refused when the old name was taken meanwhile; and when the recording was renamed again.
+        await settle()
+        touch("\(old).m4a")
+        undo.undo()
+        expect(has("Pricing Page Launch.m4a") && has("Pricing Page Launch.md"), "undo is refused when the old name is taken")
+        try? fm.removeItem(at: folder.appending(path: "\(old).m4a"))
+        // Same default name, a title already used: it gets a number like any rename.
+        touch("\(old) 2.m4a")
+        await settle()
+        expect(library.retitle(folder.appending(path: "\(old) 2.m4a"), to: "Pricing Page Launch")?.lastPathComponent == "Pricing Page Launch 2.m4a", "a taken title gets a number")
+        return failures
     }
 
     // MARK: - Self check (run with --selftest)
@@ -349,6 +477,24 @@ private enum Model {
         return result
     }
 
+    /// One short pass on the finished summary (not the transcript): the title, or nil. Never throws: a recording keeps its name when this fails.
+    static func title(summary: String) async -> String? {
+        let model = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+        guard model.availability == .available else { return nil }
+        let (code, name) = language(of: summary)
+        guard model.supportsLocale(Locale(identifier: code)) else { return nil }
+        do {
+            let session = LanguageModelSession(model: model, instructions: Summary.titleInstructions(language: name))
+            let reply = try await session.respond(to: Summary.titlePrompt(summary, language: name), options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 30))
+            let title = Summary.cleanTitle(reply.content)
+            if title == nil { log("title: no usable title in \"\(reply.content.prefix(80))\"") }
+            return title
+        } catch {
+            log("title: \(error)")
+            return nil
+        }
+    }
+
     private static func summarize(_ dialogue: [String], model: SystemLanguageModel, language: String, other: String?, ratio: Double, scale: Double,
                                   progress: @MainActor @Sendable (Double) -> Void, abandon: @MainActor @Sendable () -> Bool) async throws -> (Summary.Parts?, Int) {
         // A quarter of the window stays free for the instructions and the answer.
@@ -431,6 +577,8 @@ final class Summarizer {
     var shouldPause: () -> Bool = { false }
     /// Called when a summary ends, so a quit that waited for it goes on.
     @ObservationIgnored var onIdle: () -> Void = {}
+    /// Called once a summary is in the transcript file, with the recording as it is named now: the place for what follows from it (a title).
+    @ObservationIgnored var onWritten: (URL, Summary.Parts) async -> Void = { _, _ in }
 
     private var queue: [URL] = []
     /// Asked for with its button: only then does a model that cannot help say so.
@@ -444,6 +592,8 @@ final class Summarizer {
     private var shuttingDown = false
 
     var isBusy: Bool { states.values.contains { !$0.isFailure } }
+    /// The recording being worked on, by the name it has now.
+    var running: URL? { current?.source }
 
     /// `source`: the recording; its transcript is looked up when the work starts and again when it ends.
     func request(_ source: URL, manual isManual: Bool = false) {
@@ -525,7 +675,8 @@ final class Summarizer {
             do { try TranscriptFile.edit(target, expected: text) { Summary.insert(parts, into: $0) } } catch { return retry(source, "\(error)") }
             log("summary: \(target.lastPathComponent), \(parts.decisions.count) decisions, \(parts.actions.count) actions, \(clock.now - begin)")
             AccessibilityNotification.Announcement("Summary ready").post()
-            settle(source, done: true)
+            await onWritten(source, parts)
+            settle(current?.source ?? source, done: true)  // the hook may have renamed it
         } catch is CancellationError {
             let source = current?.source ?? started
             // Cancelled by the user (no state left) or at quit: nothing more. A recording that started: later, when it is over.

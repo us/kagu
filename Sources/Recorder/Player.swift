@@ -31,6 +31,7 @@ final class Player {
     }
 
     func load(_ url: URL) {
+        if url == self.url, player != nil { return }  // already loaded (a rename moved it here): playing goes on
         stop()
         self.url = url
         player = try? AVAudioPlayer(contentsOf: url)
@@ -75,6 +76,9 @@ final class Player {
         isPlaying = false
         time = 0
     }
+
+    /// The loaded file was renamed or moved: it keeps playing from the new place.
+    func moved(_ old: URL, to new: URL) { if url == old { url = new } }
 
     /// Lets go of `url` when it is the loaded file, so Play or Pause cannot start a recording that left the screen.
     /// Only that file: the pane that shows next may already have loaded its own.
