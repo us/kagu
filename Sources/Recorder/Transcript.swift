@@ -150,7 +150,8 @@ enum Transcript {
         let lines = markdown.split(separator: "\n", omittingEmptySubsequences: false)
         for line in lines[..<(foot(lines) ?? lines.count)] {
             if let match = line.wholeMatch(of: /\*\*(.+?)\*\* `(\d+):(\d+):(\d+)`/) {
-                let seconds = (Double(match.2) ?? 0) * 3600 + (Double(match.3) ?? 0) * 60 + (Double(match.4) ?? 0)
+                let (h, m, s): (Double, Double, Double) = (Double(match.2) ?? 0, Double(match.3) ?? 0, Double(match.4) ?? 0)
+                let seconds = h * 3600 + m * 60 + s  // in parts: as one expression it timed out the type checker on CI
                 blocks.append(Block(speaker: String(match.1), seconds: seconds, text: ""))
             } else if !blocks.isEmpty, !line.isEmpty {
                 blocks[blocks.count - 1].text += (blocks[blocks.count - 1].text.isEmpty ? "" : " ") + line
