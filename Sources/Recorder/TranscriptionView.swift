@@ -227,7 +227,6 @@ private struct GeneralSettings: View {
     @AppStorage("showMenuBar") private var showMenuBar = true
     @AppStorage("askToRecordCalls") private var askToRecordCalls = true
     @State private var notificationsOff = false
-    @AppStorage("chromeTabsDenied") private var chromeTabsDenied = false
     @State private var watchNeedsApproval = Watch.needsApproval
     @State private var autoUpdate = Updater.shared?.updater?.automaticallyDownloadsUpdates ?? true
 
@@ -251,7 +250,7 @@ private struct GeneralSettings: View {
                         Watch.set(on)
                         watchNeedsApproval = Watch.needsApproval
                     }
-                Text("Zoom, Teams, Slack, Discord, FaceTime, WhatsApp, Webex, and Google Meet in Chrome. Kagu need not stay open: a small helper notices the call and opens it. When the call ends, Kagu asks to stop and saves after 2 minutes.")
+                Text("When any app holds the microphone for 4 seconds: Zoom, Meet in a browser, Discord, FaceTime. Kagu need not stay open: a small helper notices the call and opens it. When the call ends, Kagu asks to stop and saves after 2 minutes.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if askToRecordCalls, watchNeedsApproval {
                     Label { Text("Kagu is turned off in Login Items, so it cannot notice calls while closed.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
@@ -266,12 +265,6 @@ private struct GeneralSettings: View {
                         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=local.recorder")!)
                     }
                     .controlSize(.small)
-                }
-                if askToRecordCalls, chromeTabsDenied {
-                    Label { Text("Kagu is not allowed to see Chrome tabs, so it cannot notice Google Meet.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
-                        .font(.caption).foregroundStyle(.secondary)
-                    Button("Open Automation Settings") { open("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") }
-                        .controlSize(.small)
                 }
             }
         }

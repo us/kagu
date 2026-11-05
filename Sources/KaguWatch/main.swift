@@ -4,8 +4,8 @@ import Darwin
 import Foundation
 
 // KaguWatch: the only part of Kagu that stays running (a launch agent). It sleeps until Core Audio says an app
-// started or stopped using a mic; when a call app (or Chrome, which Kagu then asks about Google Meet) holds one
-// for 4 s, it opens Kagu without a window, and Kagu asks to record the call.
+// started or stopped using a mic; when any app (see Calls.app) holds one for 4 s, it opens Kagu without a window,
+// and Kagu asks to record the call.
 
 let system = AudioObjectID(kAudioObjectSystemObject)
 let queue = DispatchQueue(label: "watch")
@@ -89,8 +89,8 @@ func changed(after seconds: Double = 4) {
 }
 
 func check() {
-    // By app name, so Chrome and its helper process count as one.
-    let calls = Set(processes().filter(usesMic).compactMap(bundleID).compactMap { Calls.callApp($0) ?? (Calls.isChrome($0) ? "Chrome" : nil) })
+    // By app, so Chrome and its helper process count as one.
+    let calls = Set(processes().filter(usesMic).compactMap(bundleID).compactMap(Calls.app))
     opened.formIntersection(calls)
     guard let call = calls.subtracting(opened).first else { return }
     opened.formUnion(calls)

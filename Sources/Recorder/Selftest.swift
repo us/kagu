@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import Calls
 
 /// `--selftest`: checks the logic that does not need a window, in a temporary folder.
 @MainActor
@@ -26,9 +27,8 @@ enum Selftest {
         let both = Transcript.merge([("You", [Segment(start: 0, end: 0.4, text: "Yeah.")]), ("Them", [Segment(start: 0, end: 0.6, text: "Okay.")])], language: "en")
         expect(both.lines.count == 2 && both.struck.fillers == 0, "a yeah inside their okay is kept: \(both.lines.map(\.text))")
         // Calls: which mic users are a call
-        expect(CallWatcher.callApp("com.hnc.Discord.helper") == "Discord" && CallWatcher.callApp("com.microsoft.teams2") == "Teams" && CallWatcher.callApp("com.apple.CoreSpeech") == nil, "call apps by bundle id")
-        expect(CallWatcher.isChrome("com.google.Chrome.helper") && !CallWatcher.isChrome("com.google.Chrome.canary") && !CallWatcher.isChrome("com.google.Chrome.app.abcdef"), "Chrome, not Canary or a Chrome web app")
-        expect(CallWatcher.isMeet("https://meet.google.com/abc-defg-hij?authuser=0") && !CallWatcher.isMeet("https://meet.google.com/landing") && !CallWatcher.isMeet("https://example.com/?u=https://meet.google.com/abc-defg-hij"), "a Meet call address")
+        expect(Calls.app("com.hnc.Discord.helper") == "Discord" && Calls.app("com.microsoft.teams2") == "Teams" && Calls.app("com.google.Chrome.helper") == "com.google.Chrome" && Calls.app("company.thebrowser.Browser.helper.renderer") == "company.thebrowser.Browser", "any app on the mic, its helpers as one")
+        expect(Calls.app("com.apple.CoreSpeech") == nil && Calls.app("com.apple.assistantd") == nil && Calls.app("local.recorder") == nil && Calls.app("systemsoundserverd") == nil && Calls.app("com.apple.WebKit.GPU") == "Safari", "not Kagu or the Mac's own listeners")
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appending(path: "recorder-selftest-\(UUID().uuidString)")
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)

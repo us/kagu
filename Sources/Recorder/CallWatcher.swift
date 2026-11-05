@@ -2,21 +2,24 @@ import AppKit
 import Calls
 import UserNotifications
 
-/// Notices a call (a call app, or Chrome on a Google Meet tab, holding a mic) and asks to record it.
+/// Notices a call (any app holding a mic for 4 s, see `Calls.app`) and asks to record it.
 /// When the call ends during a recording it asks to stop, and stops and saves by itself 2 minutes later.
 @MainActor
 final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
-    nonisolated static func callApp(_ bundle: String) -> String? { Calls.callApp(bundle) }
-    nonisolated static func isChrome(_ bundle: String) -> Bool { Calls.isChrome(bundle) }
-    nonisolated static func isMeet(_ url: String) -> Bool { url.range(of: #"^https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(?![a-z])"#, options: .regularExpression) != nil }
+    /// The name of the app behind a mic, as the banner and the recording's tag show it ("Zoom", "Google Chrome").
+    static func callApp(_ bundle: String) -> String? {
+        guard let app = Calls.app(bundle) else { return nil }
+        guard app.contains("."), let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app) else { return app }
+        return url.deletingPathExtension().lastPathComponent
+    }
 
     private unowned let model: Recorder
     private var timer: Timer?
     /// The app of the call going on: set once an app held a mic for 4 s, cleared after 10 s without.
     private var call: String?
-    /// A call app holds a mic (or Kagu is asking Chrome about Meet), a call is on, or one ended under a minute ago
+    /// An app holds a mic, a call is on, or one ended under a minute ago
     /// (one back by then is the same call, see `endedAt`): Kagu stays open meanwhile.
-    var isInCall: Bool { seenSince != nil || askingChrome || call != nil || endedAt.map { Date().timeIntervalSince($0) < 60 } == true }
+    var isInCall: Bool { seenSince != nil || call != nil || endedAt.map { Date().timeIntervalSince($0) < 60 } == true }
     private var seenSince: Date?
     private var goneSince: Date?
     /// When the last call ended: one back within a minute (a mute, a dropped line) is the same call, not asked again.
@@ -27,14 +30,6 @@ final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
     private var recordingInCall: Date?
     private var keep: Date?
     private var autoStop: Task<Void, Never>?
-    /// Whether a Chrome tab is on a Meet call, asked again every 10 s while Chrome holds the mic.
-    private var meetTab: Bool?
-    private var askedChrome: Date?
-    private var askingChrome = false
-    /// Counts Chrome letting go of the mic, so an answer that arrives after that is dropped.
-    private var chromeTurn = 0
-    /// Test aid: `--call-test` counts Chrome holding the mic as a call, without asking it for its tabs.
-    private let chromeIsCall = CommandLine.arguments.contains("--call-test")
 
     nonisolated private static let startID = "call-start", endID = "call-end"
 
@@ -68,16 +63,7 @@ final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
             if call != nil { call = nil; seenSince = nil; autoStop?.cancel(); remove(Self.startID, Self.endID) }
             return
         }
-        let users = micUsers()
-        var app = users.lazy.compactMap(Self.callApp).first
-        if app == nil, users.contains(where: Self.isChrome) {
-            if chromeIsCall { meetTab = true } else if askedChrome.map({ Date().timeIntervalSince($0) >= 10 }) ?? true { askChrome() }
-            if meetTab == true { app = "Google Meet" }
-        } else if !users.contains(where: Self.isChrome), askedChrome != nil || meetTab != nil {
-            meetTab = nil
-            askedChrome = nil
-            chromeTurn += 1
-        }
+        let app = micUsers().lazy.compactMap(Self.callApp).first
         let now = Date()
         if app != nil { goneSince = nil; seenSince = seenSince ?? now } else { seenSince = nil; goneSince = goneSince ?? now }
 
@@ -119,41 +105,6 @@ final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
             log("calls: stopping, the call ended 2 minutes ago")
             self.model.stop(reason: "Saved: the call ended 2 minutes ago.")
         }
-    }
-
-    /// Asks Chrome for its tab addresses off the main thread (the first time macOS asks the owner to allow it).
-    private func askChrome() {
-        guard !askingChrome else { return }
-        askingChrome = true
-        askedChrome = Date()
-        let turn = chromeTurn
-        Task.detached {
-            let found = Self.chromeHasMeetTab()
-            await MainActor.run {
-                self.askingChrome = false
-                if self.chromeTurn == turn { self.meetTab = found }
-            }
-        }
-    }
-
-    nonisolated private static func chromeHasMeetTab() -> Bool {
-        let script = Process()
-        script.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        script.arguments = ["-e", "with timeout of 5 seconds", "-e", "tell application id \"com.google.Chrome\" to get URL of every tab of every window", "-e", "end timeout"]
-        let out = Pipe(), err = Pipe()
-        script.standardOutput = out
-        script.standardError = err
-        do { try script.run() } catch { return false }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        script.waitUntilExit()
-        guard script.terminationStatus == 0 else {
-            let text = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            log("calls: could not read Chrome tabs: \(text)")
-            if text.contains("-1743") { UserDefaults.standard.set(true, forKey: "chromeTabsDenied") }  // Automation denied: Settings says so
-            return false
-        }
-        if UserDefaults.standard.bool(forKey: "chromeTabsDenied") { UserDefaults.standard.set(false, forKey: "chromeTabsDenied") }
-        return String(decoding: data, as: UTF8.self).components(separatedBy: ", ").contains { isMeet($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
 
     private func post(_ id: String, title: String, body: String) {
