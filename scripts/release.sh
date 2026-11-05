@@ -27,7 +27,7 @@ fi
 scripts/make-dmg.sh  # builds Kagu.app too
 ZIP="dist/Kagu-$V.zip"
 rm -f "$ZIP"
-ditto -c -k --keepParent Kagu.app "$ZIP"
+ditto -c -k --keepParent build.noindex/Kagu.app "$ZIP"
 SIGNATURE=$("$TOOLS/sign_update" --ed-key-file "$KEY" "$ZIP")
 cat > dist/appcast.xml <<XML
 <?xml version="1.0" encoding="utf-8"?>

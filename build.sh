@@ -1,12 +1,12 @@
 #!/bin/sh
-# Builds and signs Kagu.app next to this script.
+# Builds and signs build.noindex/Kagu.app (".noindex": Spotlight lists only the installed Kagu).
 set -eu
 cd "$(dirname "$0")"
 IDENTITY="${IDENTITY:-Apple Development: Recep Saritekin (5TTV65YL4S)}"
 
 [ -x vendor/whisper-cli ] || ./scripts/build-whisper.sh
 swift build -c release
-APP=Kagu.app
+APP=build.noindex/Kagu.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp .build/release/Recorder "$APP/Contents/MacOS/Recorder"

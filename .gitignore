@@ -1,6 +1,7 @@
 .build/
 Recorder.app/
 Kagu.app/
+build.noindex/
 vendor/
 work/
 transcripts/
