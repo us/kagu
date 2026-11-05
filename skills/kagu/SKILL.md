@@ -9,7 +9,7 @@ Kagu is a Mac app that records the microphone and everything the Mac plays into 
 
 ## Where things are
 
-- Library: `~/Music/Recordings`. Each subfolder is a folder in Kagu's sidebar (for example `~/Music/Recordings/Clients`).
+- Library: `~/Music/Recordings`. Each subfolder is a folder in Kagu's sidebar (for example `~/Music/Recordings/Clients`). The owner names folders after projects: when asked about a project's meetings (for example in the `xheron` repo), look in the folder of that name first (`~/Music/Recordings/xheron`), then in the top level, which holds recordings not filed yet.
 - A recording: `<title>.m4a`. Its transcript sits next to it: `<title>.md`, or `<title>.transcript.md` when a different `<title>.md` was already there. A recording that still has Kagu's default name (`Recording <date> <time>`) may be given a short title from its summary once the summary is made, so the file name can change after the first look.
 - Hidden files you can ignore: `.<title>.tracks.m4a` (the two sides kept apart for a later transcript), `.Recording ....caf` (a recording still being written or waiting to be recovered; never move or delete it).
 - The app's log: `~/Library/Logs/Recorder.log`.
