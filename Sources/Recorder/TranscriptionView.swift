@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Calls
 import ServiceManagement
 import SwiftUI
 import UserNotifications
@@ -250,8 +251,9 @@ private struct GeneralSettings: View {
                         Watch.set(on)
                         watchNeedsApproval = Watch.needsApproval
                     }
-                Text("When any app holds the microphone for 4 seconds: Zoom, Meet in a browser, Discord, FaceTime. Kagu need not stay open: a small helper notices the call and opens it. When the call ends, Kagu asks to stop and saves after 2 minutes.")
+                Text("When one of these apps holds the microphone for 4 seconds. Browsers and call apps are on; any other app appears here, off, once it uses the microphone. Kagu need not stay open: a small helper notices the call and opens it. When the call ends, Kagu asks to stop and saves after 2 minutes.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if askToRecordCalls { CallApps().padding(.vertical, 4) }
                 if askToRecordCalls, watchNeedsApproval {
                     Label { Text("Kagu is turned off in Login Items, so it cannot notice calls while closed.") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
                         .font(.caption)
@@ -372,4 +374,64 @@ private struct PrivacySettings: View {
 
 private func open(_ link: String) {
     if let url = URL(string: link) { NSWorkspace.shared.open(url) }
+}
+
+/// Every app that used a mic, each with a switch for whether its calls ask to record (as in Privacy, Microphone).
+private struct CallApps: View {
+    @State private var apps: [String] = []
+    @State private var choices: [String: Bool] = [:]
+    /// Known call apps go by name in `Calls`; their bundle ids here only find the icon.
+    private static let iconIDs = [
+        "Zoom": "us.zoom.xos", "Teams": "com.microsoft.teams2", "Slack": "com.tinyspeck.slackmacgap", "Discord": "com.hnc.Discord",
+        "FaceTime": "com.apple.FaceTime", "WhatsApp": "net.whatsapp.WhatsApp", "Webex": "Cisco-Systems.Spark", "Skype": "com.skype.skype",
+        "Telegram": "ru.keepcoder.Telegram", "Signal": "org.whispersystems.signal-desktop", "Safari": "com.apple.Safari",
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if apps.isEmpty {
+                Text("No app has used the microphone yet.").font(.caption).foregroundStyle(.secondary).padding(8)
+            }
+            ForEach(apps, id: \.self) { app in
+                Toggle(isOn: binding(app)) {
+                    HStack(spacing: 8) {
+                        Image(nsImage: icon(app)).resizable().frame(width: 18, height: 18).accessibilityHidden(true)
+                        Text(CallWatcher.name(app)).lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                .toggleStyle(SwitchRight()).controlSize(.small)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                if app != apps.last { Divider().padding(.leading, 34) }
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.card.opacity(0.6)))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.line))
+        .onAppear(perform: load)
+        // An app Kagu just saw on the mic shows up while Settings is open; one KaguWatch saw, when Kagu comes to the front.
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in load() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in load() }
+    }
+
+    private func load() {
+        let seen = (Calls.defaults.stringArray(forKey: Calls.seenKey) ?? []).sorted { CallWatcher.name($0).localizedStandardCompare(CallWatcher.name($1)) == .orderedAscending }
+        if seen != apps { apps = seen }
+        let stored = Calls.defaults.dictionary(forKey: Calls.choicesKey) as? [String: Bool] ?? [:]
+        if stored != choices { choices = stored }
+    }
+
+    private func binding(_ app: String) -> Binding<Bool> {
+        Binding {
+            choices[app] ?? Calls.asksByDefault(app)
+        } set: { on in
+            // Only a choice that differs from the default is kept, so a later default change still reaches the others.
+            choices[app] = on == Calls.asksByDefault(app) ? nil : on
+            Calls.defaults.set(choices, forKey: Calls.choicesKey)
+        }
+    }
+
+    private func icon(_ app: String) -> NSImage {
+        let id = Self.iconIDs[app] ?? app
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return NSImage(systemSymbolName: "app", accessibilityDescription: nil) ?? NSImage() }
+        return NSWorkspace.shared.icon(forFile: url.path)
+    }
 }

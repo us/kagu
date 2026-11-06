@@ -4,7 +4,7 @@ import Darwin
 import Foundation
 
 // KaguWatch: the only part of Kagu that stays running (a launch agent). It sleeps until Core Audio says an app
-// started or stopped using a mic; when any app (see Calls.app) holds one for 4 s, it opens Kagu without a window,
+// started or stopped using a mic; when an app that asks (see Calls.asks) holds one for 4 s, it opens Kagu without a window,
 // and Kagu asks to record the call.
 
 let system = AudioObjectID(kAudioObjectSystemObject)
@@ -89,8 +89,10 @@ func changed(after seconds: Double = 4) {
 }
 
 func check() {
-    // By app, so Chrome and its helper process count as one.
-    let calls = Set(processes().filter(usesMic).compactMap(bundleID).compactMap(Calls.app))
+    // By app, so Chrome and its helper process count as one. Only apps that ask (a browser, a call app, one turned on in Settings).
+    let users = Set(processes().filter(usesMic).compactMap(bundleID).compactMap(Calls.app))
+    users.forEach(Calls.saw)
+    let calls = users.filter(Calls.asks)
     opened.formIntersection(calls)
     guard let call = calls.subtracting(opened).first else { return }
     opened.formUnion(calls)

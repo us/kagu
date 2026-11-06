@@ -2,13 +2,12 @@ import AppKit
 import Calls
 import UserNotifications
 
-/// Notices a call (any app holding a mic for 4 s, see `Calls.app`) and asks to record it.
+/// Notices a call (an app that asks, see `Calls.asks`, holding a mic for 4 s) and asks to record it.
 /// When the call ends during a recording it asks to stop, and stops and saves by itself 2 minutes later.
 @MainActor
 final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
-    /// The name of the app behind a mic, as the banner and the recording's tag show it ("Zoom", "Google Chrome").
-    static func callApp(_ bundle: String) -> String? {
-        guard let app = Calls.app(bundle) else { return nil }
+    /// The name of an app as `Calls.app` gives it, as the banner, the recording's tag and Settings show it ("Zoom", "Google Chrome").
+    static func name(_ app: String) -> String {
         guard app.contains("."), let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app) else { return app }
         return url.deletingPathExtension().lastPathComponent
     }
@@ -63,7 +62,9 @@ final class CallWatcher: NSObject, UNUserNotificationCenterDelegate {
             if call != nil { call = nil; seenSince = nil; autoStop?.cancel(); remove(Self.startID, Self.endID) }
             return
         }
-        let app = micUsers().lazy.compactMap(Self.callApp).first
+        let users = micUsers().compactMap(Calls.app)
+        users.forEach(Calls.saw)
+        let app = users.first(where: Calls.asks).map(Self.name)
         let now = Date()
         if app != nil { goneSince = nil; seenSince = seenSince ?? now } else { seenSince = nil; goneSince = goneSince ?? now }
 

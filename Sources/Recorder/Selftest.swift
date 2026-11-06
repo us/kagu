@@ -29,6 +29,7 @@ enum Selftest {
         // Calls: which mic users are a call
         expect(Calls.app("com.hnc.Discord.helper") == "Discord" && Calls.app("com.microsoft.teams2") == "Teams" && Calls.app("com.google.Chrome.helper") == "com.google.Chrome" && Calls.app("company.thebrowser.Browser.helper.renderer") == "company.thebrowser.Browser", "any app on the mic, its helpers as one")
         expect(Calls.app("com.apple.CoreSpeech") == nil && Calls.app("com.apple.assistantd") == nil && Calls.app("local.recorder") == nil && Calls.app("systemsoundserverd") == nil && Calls.app("com.apple.WebKit.GPU") == "Safari", "not Kagu or the Mac's own listeners")
+        expect(Calls.asksByDefault("Discord") && Calls.asksByDefault("com.google.Chrome") && Calls.asksByDefault("company.thebrowser.dia") && !Calls.asksByDefault("com.googlecode.iterm2") && !Calls.asksByDefault("com.ableton.live") && !Calls.asksByDefault("com.anthropic.claudefordesktop"), "browsers and call apps ask by default, other apps do not")
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appending(path: "recorder-selftest-\(UUID().uuidString)")
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)
