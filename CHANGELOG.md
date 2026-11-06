@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/us/kagu/compare/v0.2.6...v0.2.7) (2026-11-06)
+
+
+### Bug Fixes
+
+* **calls:** ask only for browsers and call apps unless turned on ([f390072](https://github.com/us/kagu/commit/f390072f070d1bd9b9f4023a74eb91d1d9b0bcf7))
+
 ## [0.2.6](https://github.com/us/kagu/compare/v0.2.5...v0.2.6) (2026-11-05)
 
 
